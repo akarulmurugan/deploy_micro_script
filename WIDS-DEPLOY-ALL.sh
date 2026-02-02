@@ -1,222 +1,218 @@
-cat > ~/WIDS-DEPLOY-ALL.sh << 'EOF_DEPLOY_ALL'
 #!/bin/bash
-echo "🔥 WIDS-PROTECTOR v3.1 → TOTAL RESET + DEPLOY"
+# WIDS-PROTECTOR v3.2 — FULL SINGLE-FILE DEPLOY (ERROR-HANDLED)
 
-# ========================================
-# 0. STOP EVERYTHING + FULL CLEAN
-# ========================================
-echo "🛑 STOPPING ALL SERVICES..."
-sudo systemctl stop mosquitto wids* nginx apache2 || true
-sudo pkill -9 -f "mosquitto\|flask\|wids\|python.*wids" || true
-sudo fuser -k 1883/tcp 1884/tcp 5000/tcp 8080/tcp 9999/udp || true
+set -Eeuo pipefail
+trap 'echo "❌ ERROR at line $LINENO"; exit 1' ERR
 
-echo "🧹 FULL CLEANUP..."
-sudo rm -rf /root/WIDS-PROTECTOR /etc/systemd/system/wids* /etc/mosquitto/conf.d/* /etc/mosquitto/*.conf.bak /var/lib/mosquitto/*
-sudo systemctl daemon-reload
-sudo systemctl reset-failed
+echo "🔥 WIDS-PROTECTOR v3.2 → FULL DEPLOY START"
 
-# ========================================
-# 1. MQTT BULLETPROOF SETUP
-# ========================================
-echo "📡 MQTT SETUP..."
-sudo mkdir -p /var/lib/mosquitto /var/log/mosquitto
-sudo chown -R mosquitto:mosquitto /var/lib/mosquitto /var/log/mosquitto
-sudo usermod -a -G mosquitto root || true
+# =====================================================
+# 1. CLEAN OLD
+# =====================================================
+echo "🧹 Cleaning old setup..."
+systemctl stop mosquitto wids-engine wids-dashboard 2>/dev/null || true
+pkill -9 -f wids 2>/dev/null || true
+fuser -k 1884/tcp 5000/tcp 9999/udp 2>/dev/null || true
+rm -rf /root/WIDS-PROTECTOR /etc/systemd/system/wids-*.service
 
-cat > /etc/mosquitto/mosquitto.conf << 'MQTT_CONF'
-persistence true
-persistence_location /var/lib/mosquitto/
-log_dest file /var/log/mosquitto/mosquitto.log
-listener 1884 0.0.0.0
+# =====================================================
+# 2. INSTALL DEPENDENCIES
+# =====================================================
+apt update -qq
+apt install -y python3 python3-venv python3-pip \
+               mosquitto mosquitto-clients \
+               sqlite3 net-tools curl -qq
+
+# =====================================================
+# 3. MQTT SAFE CONFIG (1884)
+# =====================================================
+cat > /etc/mosquitto/conf.d/wids.conf <<EOF
+listener 1884
 allow_anonymous true
-max_queued_messages 1000
-MQTT_CONF
+EOF
 
-sudo systemctl restart mosquitto
-sleep 3
+systemctl restart mosquitto
+sleep 2
 
-# TEST MQTT
-if mosquitto_pub -h localhost -p 1884 -t test -m "mqtt-ready" 2>/dev/null; then
-    echo "✅ MQTT PORT 1884 → READY!"
-else
-    echo "❌ MQTT FAILED → CHECK: journalctl -u mosquitto -n20"
-    exit 1
-fi
+ss -lnt | grep -q 1884 || { echo "❌ MQTT NOT LISTENING"; exit 1; }
+echo "✅ MQTT READY"
 
-# ========================================
-# 2. WIDS ENVIRONMENT
-# ========================================
-cd /root
-rm -rf WIDS-PROTECTOR
-mkdir WIDS-PROTECTOR && cd WIDS-PROTECTOR
-sudo apt update -qq && sudo apt install -y python3-pip python3-venv mosquitto mosquitto-clients sqlite3 net-tools -qq
+# =====================================================
+# 4. PROJECT SETUP
+# =====================================================
+mkdir -p /root/WIDS-PROTECTOR/logs
+cd /root/WIDS-PROTECTOR
 
 python3 -m venv venv
-source venv/bin/activate
-pip install --upgrade pip flask paho-mqtt numpy scikit-learn psutil pandas requests -q
+venv/bin/pip install --upgrade pip flask paho-mqtt numpy scikit-learn psutil pandas -q
 
-# ========================================
-# 3. WIDS ENGINE (ML + UDP + MQTT)
-# ========================================
-cat > wids_engine.py << 'WIDS_ENGINE'
+# =====================================================
+# 5. WIDS ENGINE (FULL ERROR HANDLING)
+# =====================================================
+cat > wids_engine.py <<'PY'
 #!/usr/bin/env python3
-import os, sys, json, sqlite3, time, threading, socket, logging
-import numpy as np
+import os, sys, json, time, socket, sqlite3, threading, logging
 from datetime import datetime
-try:
-    from sklearn.ensemble import IsolationForest
-    from sklearn.preprocessing import StandardScaler
-    HAS_ML = True
-except:
-    HAS_ML = False
 
-os.makedirs('logs', exist_ok=True)
-logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(message)s', 
-                   handlers=[logging.FileHandler('logs/engine.log'), logging.StreamHandler()])
+# ---------- LOGGING ----------
+os.makedirs("logs", exist_ok=True)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+    handlers=[
+        logging.FileHandler("logs/engine.log"),
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+
+DB="wids.db"
+
+def safe(fn):
+    def wrapper(*a, **kw):
+        try:
+            return fn(*a, **kw)
+        except Exception:
+            logging.exception(f"❌ ERROR in {fn.__name__}")
+    return wrapper
 
 class WIDS:
     def __init__(self):
-        self.db = 'wids.db'
         self.init_db()
         self.count = 0
-        
+
     def init_db(self):
-        conn = sqlite3.connect(self.db)
-        conn.execute('''CREATE TABLE IF NOT EXISTS alerts 
-                       (id INTEGER PRIMARY KEY, time REAL, data TEXT)''')
-        conn.commit()
-    
+        with sqlite3.connect(DB) as c:
+            c.execute("""CREATE TABLE IF NOT EXISTS alerts(
+                id INTEGER PRIMARY KEY,
+                time REAL,
+                device TEXT,
+                ssid TEXT,
+                rssi INT
+            )""")
+
+    @safe
     def process(self, data):
+        if not isinstance(data, dict):
+            logging.warning("⚠️ Invalid data format")
+            return
+
+        if "ssid" not in data or "rssi" not in data:
+            logging.warning(f"⚠️ Missing fields: {data}")
+            return
+
         self.count += 1
-        logging.info(f"📡 #{self.count} {data.get('ssid', 'N/A')} | RSSI: {data.get('rssi', 'N/A')}")
-        
-        # Simple anomaly check
-        if data.get('rssi', 0) > -30:
+        logging.info(f"📡 #{self.count} {data.get('ssid')} RSSI={data.get('rssi')}")
+
+        if data["rssi"] > -30:
             logging.warning(f"🚨 STRONG SIGNAL ALERT: {data}")
-        
-        # Save to DB
-        conn = sqlite3.connect(self.db)
-        conn.execute("INSERT INTO alerts (time, data) VALUES (?, ?)", 
-                    (time.time(), json.dumps(data)))
-        conn.commit()
-    
+
+        with sqlite3.connect(DB) as c:
+            c.execute(
+                "INSERT INTO alerts(time,device,ssid,rssi) VALUES (?,?,?,?)",
+                (time.time(), data.get("device","unknown"),
+                 data["ssid"], data["rssi"])
+            )
+
+    @safe
     def udp_server(self):
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.bind(('0.0.0.0', 9999))
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.bind(("0.0.0.0", 9999))
         logging.info("📡 UDP listening on 9999")
         while True:
-            try:
-                data, _ = sock.recvfrom(1024)
-                self.process(json.loads(data.decode()))
-            except: pass
-    
+            data,_ = s.recvfrom(2048)
+            self.process(json.loads(data.decode()))
+
+    @safe
     def mqtt_client(self):
         import paho.mqtt.client as mqtt
-        def on_message(client, userdata, msg):
-            try: self.process(json.loads(msg.payload.decode()))
-            except: pass
-        client = mqtt.Client()
-        client.on_message = on_message
-        client.connect("localhost", 1884)
-        client.subscribe("wids/#")
-        client.loop_forever()
+
+        def on_message(c,u,m):
+            self.process(json.loads(m.payload.decode()))
+
+        c = mqtt.Client()
+        c.on_message = on_message
+        c.connect("localhost",1884)
+        c.subscribe("wids/#")
+        c.loop_forever()
 
 if __name__ == "__main__":
-    wids = WIDS()
-    threading.Thread(target=wids.udp_server, daemon=True).start()
-    wids.mqtt_client()
-WIDS_ENGINE
+    w = WIDS()
+    threading.Thread(target=w.udp_server, daemon=True).start()
+    w.mqtt_client()
+PY
 
 chmod +x wids_engine.py
 
-# ========================================
-# 4. DASHBOARD
-# ========================================
-cat > dashboard.py << 'DASHBOARD'
+# =====================================================
+# 6. DASHBOARD
+# =====================================================
+cat > dashboard.py <<'PY'
 from flask import Flask
 import sqlite3, subprocess
+
 app = Flask(__name__)
 
-@app.route('/')
-def index():
-    try:
-        conn = sqlite3.connect('wids.db')
-        alerts = conn.execute('SELECT * FROM alerts ORDER BY id DESC LIMIT 15').fetchall()
-        html = "<h1>🚀 WIDS-PROTECTOR LIVE</h1><h2>Recent Alerts:</h2><pre>"
-        for alert in alerts:
-            html += f"ID:{alert[0]} | {alert[1]:.0f}s | {alert[2][:100]}...\n"
-        html += "</pre><p><a href='/logs'>Live Logs</a></p>"
-        return html
-    except Exception as e:
-        return f"<h1>WIDS</h1><p>{e}</p>"
+@app.route("/")
+def home():
+    with sqlite3.connect("wids.db") as c:
+        rows = c.execute("SELECT * FROM alerts ORDER BY id DESC LIMIT 15").fetchall()
+    html = "<h1>🚀 WIDS LIVE</h1><pre>"
+    for r in rows:
+        html += f"{r}\n"
+    return html + "</pre><a href='/logs'>View Logs</a>"
 
-@app.route('/logs')
+@app.route("/logs")
 def logs():
-    try:
-        return subprocess.check_output(['tail', '-n', '20', 'logs/engine.log']).decode()
-    except:
-        return "No logs"
+    return subprocess.getoutput("tail -n 20 logs/engine.log")
 
-if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000)
-DASHBOARD
+app.run("0.0.0.0",5000)
+PY
 
 chmod +x dashboard.py
 
-# ========================================
-# 5. SYSTEMD SERVICES
-# ========================================
-cat > /etc/systemd/system/wids-engine.service << 'SERVICE1'
+# =====================================================
+# 7. SYSTEMD SERVICES
+# =====================================================
+cat > /etc/systemd/system/wids-engine.service <<EOF
 [Unit]
 Description=WIDS Engine
 After=mosquitto.service
+
 [Service]
 ExecStart=/root/WIDS-PROTECTOR/venv/bin/python /root/WIDS-PROTECTOR/wids_engine.py
 WorkingDirectory=/root/WIDS-PROTECTOR
 Restart=always
-User=root
+RestartSec=3
+
 [Install]
 WantedBy=multi-user.target
-SERVICE1
+EOF
 
-cat > /etc/systemd/system/wids-dashboard.service << 'SERVICE2'
+cat > /etc/systemd/system/wids-dashboard.service <<EOF
 [Unit]
 Description=WIDS Dashboard
 After=wids-engine.service
+
 [Service]
 ExecStart=/root/WIDS-PROTECTOR/venv/bin/python /root/WIDS-PROTECTOR/dashboard.py
 WorkingDirectory=/root/WIDS-PROTECTOR
 Restart=always
-User=root
+
 [Install]
 WantedBy=multi-user.target
-SERVICE2
+EOF
 
-# ========================================
-# 6. START ALL SERVICES
-# ========================================
-sudo systemctl daemon-reload
-sudo systemctl enable mosquitto wids-engine wids-dashboard
-sudo systemctl restart mosquitto wids-engine wids-dashboard
+systemctl daemon-reload
+systemctl enable --now mosquitto wids-engine wids-dashboard
 
 IP=$(hostname -I | awk '{print $1}')
 echo "
-🎉🎉🎉 WIDS-PROTECTOR v3.1 → LIVE! 🎉🎉🎉
+✅ WIDS-PROTECTOR v3.2 LIVE
 
-🌐 DASHBOARD: http://$IP:5000
-📡 MQTT: $IP:1884 ✓
-🔌 UDP: $IP:9999 ✓
+🌐 Dashboard: http://$IP:5000
+📡 MQTT:      $IP:1884
+📡 UDP:       $IP:9999
 
-✅ STATUS:
-$(sudo systemctl is-active mosquitto) | $(sudo systemctl is-active wids-engine) | $(sudo systemctl is-active wids-dashboard)
-
-🧪 TEST NOW:
-mosquitto_pub -h localhost -p 1884 -t wids/esp32 -m '{\"ssid\":\"EVIL\",\"rssi\":-20}'
-
-📊 TAIL LOGS: tail -f /root/WIDS-PROTECTOR/logs/engine.log
+🧪 TEST:
+mosquitto_pub -h localhost -p 1884 -t wids/test -m '{\"ssid\":\"EVIL\",\"rssi\":-20}'
 "
-EOF_DEPLOY_ALL
-
-chmod +x ~/WIDS-DEPLOY-ALL.sh
-echo "🚀 RUN: ./WIDS-DEPLOY-ALL.sh"
-echo "✅ ONE COMMAND → FULL DEPLOY!"
