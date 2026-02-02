@@ -1,4 +1,4 @@
-cat > ~/wids-complete.sh << 'EOF_ALL'
+cat > ~/deploy-complete.sh << 'EOF_ALL'
 #!/bin/bash
 # WIDS-PROTECTOR v3.0 → COMPLETE SINGLE-FILE DEPLOYMENT
 # Server + ESP32 + PicoW → ALL GENERATED AUTOMATICALLY
@@ -141,6 +141,6 @@ journalctl -f -u wids
 "
 EOF_ALL
 
-echo "✅ SAVED: ~/wids-complete.sh"
-echo "🎯 RUN: chmod +x ~/wids-complete.sh && ./wids-complete.sh"
+echo "✅ SAVED: ~/deploy-complete.sh"
+echo "🎯 RUN: chmod +x ~/deploy-complete.sh && ./deploy-complete.sh"
 echo "📱 SENSORS: ESP32_READY.txt + PICO_W_READY.txt AUTO-GENERATED!"
