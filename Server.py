@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-WIDS SERVER with iptables auto-blocking and MAC authorization
+WIDS SERVER - FIXED VERSION
+Dashboard shows devices, MACs added in dashboard update server.py
 """
 from flask import Flask, request, jsonify, render_template_string
 from datetime import datetime, timedelta
@@ -10,6 +11,7 @@ import subprocess
 import threading
 import time
 import os
+import re
 
 app = Flask(__name__)
 
@@ -19,220 +21,85 @@ WHITELIST_MACS = [
     "11:22:33:44:55:66",  # Example: Your phone MAC
 ]
 
-BLOCK_DURATION = 3600  # Block for 1 hour (seconds)
-AUTO_BLOCK_THRESHOLD = 10  # Auto-block if packets/sec > this
+# File to persist authorized MACs
+AUTHORIZED_MACS_FILE = "authorized_macs.json"
 
 # ========== DATA STORAGE ==========
 devices = {}          # MAC -> device info
 packets = []          # Recent packets
 blocked_macs = set()  # Manually blocked devices
 sensors = {}          # Sensor info
-authorized_macs = set(WHITELIST_MACS)  # Authorized MACs
-packet_rates = defaultdict(list)  # MAC -> list of timestamps for rate calculation
+authorized_macs = set()  # Authorized MACs (loaded from file)
+packet_rates = defaultdict(list)  # MAC -> list of timestamps
+threat_log = []       # Threat detection log
 
-# ========== IPTABLES MANAGER ==========
-class IPTablesManager:
-    def __init__(self):
-        self.iptables_chain = "WIDS_BLOCK"  # Custom iptables chain
-        self.setup_iptables_chain()
-    
-    def setup_iptables_chain(self):
-        """Create custom iptables chain if not exists"""
-        try:
-            # Check if chain exists
-            result = subprocess.run(
-                ["sudo", "iptables", "-L", self.iptables_chain, "-n"],
-                capture_output=True,
-                text=True
-            )
-            
-            if result.returncode != 0:
-                # Create chain
-                subprocess.run(["sudo", "iptables", "-N", self.iptables_chain], check=True)
-                print(f"✅ Created iptables chain: {self.iptables_chain}")
-                
-                # Add chain to INPUT and FORWARD
-                subprocess.run(
-                    ["sudo", "iptables", "-I", "INPUT", "-j", self.iptables_chain],
-                    check=True
-                )
-                subprocess.run(
-                    ["sudo", "iptables", "-I", "FORWARD", "-j", self.iptables_chain],
-                    check=True
-                )
-                print("✅ Added chain to INPUT and FORWARD")
-        except Exception as e:
-            print(f"⚠️ Warning: Could not setup iptables chain: {e}")
-    
-    def block_mac(self, mac_address, duration=BLOCK_DURATION):
-        """Block a MAC address using iptables"""
-        try:
-            # Convert MAC to lowercase without colons for iptables
-            mac_clean = mac_address.lower().replace(':', '')
-            
-            # Check if already blocked
-            check_cmd = [
-                "sudo", "iptables", "-C", self.iptables_chain,
-                "-m", "mac", "--mac-source", mac_address,
-                "-j", "DROP"
-            ]
-            
-            result = subprocess.run(check_cmd, capture_output=True, text=True)
-            
-            if result.returncode != 0:  # Not already blocked
-                # Add blocking rule
-                block_cmd = [
-                    "sudo", "iptables", "-A", self.iptables_chain,
-                    "-m", "mac", "--mac-source", mac_address,
-                    "-j", "DROP"
-                ]
-                subprocess.run(block_cmd, check=True)
-                
-                print(f"🚫 iptables: Blocked MAC {mac_address}")
-                
-                # Schedule unblock
-                if duration > 0:
-                    threading.Timer(
-                        duration,
-                        self.unblock_mac,
-                        args=[mac_address]
-                    ).start()
-                
-                return True
-            else:
-                print(f"ℹ️ MAC {mac_address} already blocked in iptables")
-                return False
-                
-        except Exception as e:
-            print(f"❌ Error blocking MAC {mac_address}: {e}")
-            return False
-    
-    def unblock_mac(self, mac_address):
-        """Unblock a MAC address from iptables"""
-        try:
-            # Remove blocking rule
-            unblock_cmd = [
-                "sudo", "iptables", "-D", self.iptables_chain,
-                "-m", "mac", "--mac-source", mac_address,
-                "-j", "DROP"
-            ]
-            
-            result = subprocess.run(unblock_cmd, capture_output=True, text=True)
-            
-            if result.returncode == 0:
-                print(f"✅ iptables: Unblocked MAC {mac_address}")
-                return True
-            else:
-                # Rule might not exist, try alternative removal
-                print(f"⚠️ Could not find rule for MAC {mac_address}, cleaning up...")
-                self.cleanup_rules()
-                return False
-                
-        except Exception as e:
-            print(f"❌ Error unblocking MAC {mac_address}: {e}")
-            return False
-    
-    def cleanup_rules(self):
-        """Remove all rules from WIDS chain"""
-        try:
-            # Flush the chain (remove all rules)
-            subprocess.run(["sudo", "iptables", "-F", self.iptables_chain], check=True)
-            print("🧹 Cleaned up iptables WIDS rules")
-            return True
-        except Exception as e:
-            print(f"❌ Error cleaning iptables: {e}")
-            return False
-    
-    def list_blocked(self):
-        """List currently blocked MACs"""
-        try:
-            result = subprocess.run(
-                ["sudo", "iptables", "-L", self.iptables_chain, "-n", "-v"],
-                capture_output=True,
-                text=True
-            )
-            
-            blocked = []
-            for line in result.stdout.split('\n'):
-                if "MAC" in line and "DROP" in line:
-                    # Extract MAC address from line
-                    parts = line.split()
-                    for part in parts:
-                        if ":" in part and len(part) == 17:  # MAC address
-                            blocked.append(part)
-            
-            return blocked
-        except Exception as e:
-            print(f"❌ Error listing blocked MACs: {e}")
-            return []
-    
-    def is_blocked(self, mac_address):
-        """Check if MAC is currently blocked"""
-        blocked = self.list_blocked()
-        return mac_address in blocked
+# ========== LOAD AUTHORIZED MACS FROM FILE ==========
+def load_authorized_macs():
+    """Load authorized MACs from file"""
+    global authorized_macs
+    try:
+        if os.path.exists(AUTHORIZED_MACS_FILE):
+            with open(AUTHORIZED_MACS_FILE, 'r') as f:
+                data = json.load(f)
+                authorized_macs = set(data.get('authorized_macs', WHITELIST_MACS))
+            print(f"✅ Loaded {len(authorized_macs)} authorized MACs from file")
+        else:
+            authorized_macs = set(WHITELIST_MACS)
+            save_authorized_macs()
+    except Exception as e:
+        print(f"❌ Error loading authorized MACs: {e}")
+        authorized_macs = set(WHITELIST_MACS)
 
-# Initialize iptables manager
-iptables = IPTablesManager()
-
-# ========== THREAT DETECTION ==========
-class ThreatDetector:
-    def __init__(self):
-        self.suspicious_patterns = [
-            "deauth", "disassoc", "auth", "probe", "beacon_flood"
-        ]
-    
-    def analyze_packet(self, packet_data):
-        """Analyze packet for suspicious patterns"""
-        threats = []
+def save_authorized_macs():
+    """Save authorized MACs to file"""
+    try:
+        with open(AUTHORIZED_MACS_FILE, 'w') as f:
+            json.dump({
+                'authorized_macs': list(authorized_macs),
+                'last_updated': datetime.now().isoformat()
+            }, f, indent=2)
+        print(f"💾 Saved {len(authorized_macs)} authorized MACs to file")
         
-        # Check for deauthentication packets (simplified)
-        if packet_data.get('packet_type') == 'deauth':
-            threats.append({
-                'type': 'deauthentication_attack',
-                'severity': 'high',
-                'description': 'Deauthentication packet detected'
-            })
+        # Also update server.py file with new MACs
+        update_server_py_with_macs()
         
-        # Check packet rate
-        mac = packet_data.get('mac', '')
-        if mac:
-            current_time = time.time()
-            packet_rates[mac].append(current_time)
-            
-            # Keep only last 10 seconds of packets
-            packet_rates[mac] = [
-                t for t in packet_rates[mac] 
-                if current_time - t < 10
-            ]
-            
-            # Calculate packets per second
-            pps = len(packet_rates[mac]) / 10.0
-            
-            if pps > AUTO_BLOCK_THRESHOLD:
-                threats.append({
-                    'type': 'packet_flood',
-                    'severity': 'critical',
-                    'description': f'High packet rate: {pps:.1f} packets/sec'
-                })
-        
-        # Check if MAC is in whitelist
-        if mac not in authorized_macs:
-            threats.append({
-                'type': 'unauthorized_device',
-                'severity': 'medium',
-                'description': 'Device not in authorized list'
-            })
-        
-        return threats
+    except Exception as e:
+        print(f"❌ Error saving authorized MACs: {e}")
 
-threat_detector = ThreatDetector()
+def update_server_py_with_macs():
+    """Update server.py file with current authorized MACs"""
+    try:
+        # Read current server.py
+        with open(__file__, 'r') as f:
+            content = f.read()
+        
+        # Create MAC list string
+        mac_list_str = "[\n"
+        for mac in sorted(authorized_macs):
+            mac_list_str += f'    "{mac}",  # Added via dashboard\n'
+        mac_list_str += "]"
+        
+        # Update the WHITELIST_MACS definition
+        pattern = r'WHITELIST_MACS\s*=\s*\[[^\]]*\]'
+        new_content = re.sub(pattern, f'WHITELIST_MACS = {mac_list_str}', content)
+        
+        # Write back
+        with open(__file__, 'w') as f:
+            f.write(new_content)
+        
+        print(f"📝 Updated server.py with {len(authorized_macs)} authorized MACs")
+    except Exception as e:
+        print(f"⚠️ Could not update server.py: {e}")
 
-# ========== DASHBOARD HTML (UPDATED) ==========
+# Load authorized MACs on startup
+load_authorized_macs()
+
+# ========== DASHBOARD HTML ==========
 HTML = """
 <!DOCTYPE html>
 <html>
 <head>
-    <title>WIDS Dashboard with Auto-Blocking</title>
+    <title>WIDS Dashboard</title>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <style>
@@ -246,15 +113,9 @@ HTML = """
         .header p { color: #94a3b8; font-size: 14px; }
         
         /* Stats Cards */
-        .stats { display: grid; grid-template-columns: repeat(5, 1fr); gap: 20px; padding: 20px; }
+        .stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 20px; padding: 20px; }
         .stat-card { background: #1e293b; padding: 20px; border-radius: 10px; border-left: 4px solid #3b82f6; }
-        .stat-card.critical { border-left-color: #ef4444; }
-        .stat-card.warning { border-left-color: #f59e0b; }
-        .stat-card.success { border-left-color: #10b981; }
         .stat-card h3 { font-size: 32px; color: #60a5fa; margin-bottom: 5px; }
-        .stat-card.critical h3 { color: #ef4444; }
-        .stat-card.warning h3 { color: #f59e0b; }
-        .stat-card.success h3 { color: #10b981; }
         .stat-card p { color: #94a3b8; font-size: 14px; }
         
         /* Tabs */
@@ -293,9 +154,10 @@ HTML = """
         
         /* Log entries */
         .log-entry { padding: 10px 15px; border-bottom: 1px solid #334155; font-size: 13px; }
-        .log-entry.critical { background: #ef444410; border-left: 3px solid #ef4444; }
-        .log-entry.warning { background: #f59e0b10; border-left: 3px solid #f59e0b; }
         .log-entry.info { background: #3b82f610; border-left: 3px solid #3b82f6; }
+        .log-entry.success { background: #10b98110; border-left: 3px solid #10b981; }
+        .log-entry.warning { background: #f59e0b10; border-left: 3px solid #f59e0b; }
+        .log-entry.error { background: #ef444410; border-left: 3px solid #ef4444; }
         .log-time { color: #94a3b8; font-size: 12px; }
         .log-message { margin-top: 3px; }
         
@@ -309,12 +171,15 @@ HTML = """
         
         /* Refresh button */
         .refresh-btn { background: #3b82f6; color: white; border: none; padding: 8px 16px; border-radius: 4px; cursor: pointer; margin: 10px; }
+        
+        /* Manual test section */
+        .test-section { background: #1e293b; padding: 20px; margin: 20px; border-radius: 10px; }
     </style>
 </head>
 <body>
     <div class="header">
-        <h1>🛡️ WIDS Dashboard with Auto-Blocking</h1>
-        <p>Wireless Intrusion Detection System | iptables Auto-Block | MAC Authorization</p>
+        <h1>📡 WIDS Dashboard</h1>
+        <p>Wireless Intrusion Detection System | Real-time Monitoring</p>
         <button class="refresh-btn" onclick="loadDashboard()">🔄 Refresh</button>
     </div>
     
@@ -327,26 +192,34 @@ HTML = """
             <h3 id="totalPackets">0</h3>
             <p>Packets Received</p>
         </div>
-        <div class="stat-card warning">
-            <h3 id="unauthorizedDevices">0</h3>
-            <p>Unauthorized</p>
-        </div>
-        <div class="stat-card critical">
-            <h3 id="blockedDevices">0</h3>
-            <p>Blocked (iptables)</p>
-        </div>
-        <div class="stat-card success">
+        <div class="stat-card">
             <h3 id="authorizedDevices">0</h3>
             <p>Authorized</p>
         </div>
+        <div class="stat-card">
+            <h3 id="unauthorizedDevices">0</h3>
+            <p>Unauthorized</p>
+        </div>
+    </div>
+    
+    <!-- Manual Test Section -->
+    <div class="test-section">
+        <h3>📡 Manual Packet Test</h3>
+        <p>Use this to test if server is receiving packets:</p>
+        <div class="form-group">
+            <input type="text" id="testMac" class="form-input" placeholder="AA:BB:CC:DD:EE:FF" value="AA:BB:CC:DD:EE:FF">
+            <input type="number" id="testRSSI" class="form-input" placeholder="RSSI" value="-65">
+            <input type="number" id="testChannel" class="form-input" placeholder="Channel" value="6">
+            <button class="btn btn-authorize" onclick="sendTestPacket()">Send Test Packet</button>
+        </div>
+        <p id="testResult" style="margin-top: 10px; color: #94a3b8;"></p>
     </div>
     
     <div class="tabs">
         <div class="tab active" onclick="switchTab('devices')">📱 Devices</div>
         <div class="tab" onclick="switchTab('authorized')">✅ Authorized MACs</div>
-        <div class="tab" onclick="switchTab('blocked')">🚫 Blocked Devices</div>
-        <div class="tab" onclick="switchTab('threats')">⚠️ Threat Log</div>
-        <div class="tab" onclick="switchTab('settings')">⚙️ Settings</div>
+        <div class="tab" onclick="switchTab('packets')">📦 Packet Log</div>
+        <div class="tab" onclick="switchTab('logs')">📝 System Log</div>
     </div>
     
     <div class="main-content">
@@ -363,13 +236,14 @@ HTML = """
                             <th>Signal</th>
                             <th>Channel</th>
                             <th>Packets</th>
-                            <th>Rate</th>
+                            <th>Last Seen</th>
                             <th>Status</th>
-                            <th>Authorization</th>
                             <th>Actions</th>
                         </tr>
                     </thead>
-                    <tbody id="deviceTable"></tbody>
+                    <tbody id="deviceTable">
+                        <tr><td colspan="7" style="text-align: center; padding: 20px;">No devices detected yet. Send a test packet above.</td></tr>
+                    </tbody>
                 </table>
             </div>
         </div>
@@ -378,17 +252,21 @@ HTML = """
         <div id="tab-authorized" class="tab-content">
             <div class="panel-header">
                 <h3>Authorized MAC Addresses</h3>
+                <p style="color: #94a3b8; font-size: 12px; margin-top: 5px;">
+                    MACs added here will be saved to server.py file
+                </p>
             </div>
             <div class="form-group">
-                <input type="text" id="newMac" class="form-input" placeholder="AA:BB:CC:DD:EE:FF">
+                <input type="text" id="newMac" class="form-input" placeholder="Enter MAC (AA:BB:CC:DD:EE:FF)">
                 <button class="btn btn-authorize" onclick="addAuthorizedMac()">Add Authorized MAC</button>
+                <button class="btn" onclick="reloadAuthorizedMacs()" style="background: #8b5cf6;">Reload from File</button>
             </div>
             <div style="overflow-x: auto;">
                 <table>
                     <thead>
                         <tr>
                             <th>MAC Address</th>
-                            <th>Added At</th>
+                            <th>Status</th>
                             <th>Actions</th>
                         </tr>
                     </thead>
@@ -397,68 +275,46 @@ HTML = """
             </div>
         </div>
         
-        <!-- Blocked Devices Tab -->
-        <div id="tab-blocked" class="tab-content">
+        <!-- Packet Log Tab -->
+        <div id="tab-packets" class="tab-content">
             <div class="panel-header">
-                <h3>Blocked Devices (iptables)</h3>
+                <h3>Recent Packets</h3>
             </div>
-            <div style="overflow-x: auto;">
-                <table>
-                    <thead>
-                        <tr>
-                            <th>MAC Address</th>
-                            <th>Blocked At</th>
-                            <th>Reason</th>
-                            <th>Actions</th>
-                        </tr>
-                    </thead>
-                    <tbody id="blockedTable"></tbody>
-                </table>
-            </div>
-        </div>
-        
-        <!-- Threat Log Tab -->
-        <div id="tab-threats" class="tab-content">
-            <div class="panel-header">
-                <h3>Threat Detection Log</h3>
-            </div>
-            <div id="threatLog" style="max-height: 500px; overflow-y: auto;">
+            <div id="packetLog" style="max-height: 500px; overflow-y: auto; padding: 15px;">
                 <div class="log-entry info">
-                    <div class="log-time" id="currentTime">--:--:--</div>
-                    <div class="log-message">✅ Threat detection system active</div>
+                    <div class="log-time">--:--:--</div>
+                    <div class="log-message">Waiting for packets...</div>
                 </div>
             </div>
         </div>
         
-        <!-- Settings Tab -->
-        <div id="tab-settings" class="tab-content">
+        <!-- System Log Tab -->
+        <div id="tab-logs" class="tab-content">
             <div class="panel-header">
-                <h3>System Settings</h3>
+                <h3>System Activity Log</h3>
             </div>
-            <div class="form-group">
-                <label class="form-label">Auto-block Threshold (packets/sec)</label>
-                <input type="number" id="blockThreshold" class="form-input" value="10" min="1" max="100">
-                
-                <label class="form-label">Block Duration (seconds)</label>
-                <input type="number" id="blockDuration" class="form-input" value="3600" min="60" max="86400">
-                
-                <button class="btn btn-authorize" onclick="updateSettings()">Update Settings</button>
-                <button class="btn" onclick="clearAllBlocks()" style="background: #ef4444;">Clear All Blocks</button>
+            <div id="systemLog" style="max-height: 500px; overflow-y: auto; padding: 15px;">
+                <div class="log-entry info">
+                    <div class="log-time" id="currentTime">--:--:--</div>
+                    <div class="log-message">System started</div>
+                </div>
             </div>
         </div>
     </div>
     
     <div class="footer">
-        <p>WIDS System v2.0 | Auto-Blocking with iptables | Server: {{ server_ip }}:{{ server_port }}</p>
+        <p>WIDS System v2.0 | Server: {{ server_ip }}:{{ server_port }} | Last Update: <span id="lastUpdate">--:--:--</span></p>
     </div>
     
     <script>
         let currentTab = 'devices';
+        let activityLog = [];
         
         // Update current time
         function updateTime() {
             const now = new Date();
             document.getElementById('currentTime').textContent = now.toLocaleTimeString();
+            document.getElementById('lastUpdate').textContent = now.toLocaleTimeString();
         }
         setInterval(updateTime, 1000);
         updateTime();
@@ -486,24 +342,26 @@ HTML = """
         // Load dashboard data
         async function loadDashboard() {
             try {
+                console.log('Loading dashboard data...');
+                
                 // Load stats
                 const statsRes = await fetch('/api/stats');
+                if (!statsRes.ok) throw new Error(`HTTP ${statsRes.status}`);
                 const stats = await statsRes.json();
                 
-                document.getElementById('totalDevices').textContent = stats.device_count;
-                document.getElementById('totalPackets').textContent = stats.packet_count;
-                document.getElementById('unauthorizedDevices').textContent = stats.unauthorized_count;
-                document.getElementById('blockedDevices').textContent = stats.blocked_count;
-                document.getElementById('authorizedDevices').textContent = stats.authorized_count;
+                document.getElementById('totalDevices').textContent = stats.device_count || 0;
+                document.getElementById('totalPackets').textContent = stats.packet_count || 0;
+                document.getElementById('authorizedDevices').textContent = stats.authorized_count || 0;
+                document.getElementById('unauthorizedDevices').textContent = stats.unauthorized_count || 0;
                 
                 // Load current tab data
                 loadTabData(currentTab);
                 
-                addLogEntry('info', '🔄 Dashboard refreshed');
+                addLog('info', 'Dashboard refreshed');
                 
             } catch (error) {
                 console.error('Error loading dashboard:', error);
-                addLogEntry('critical', '❌ Error loading data');
+                addLog('error', `Failed to load dashboard: ${error.message}`);
             }
         }
         
@@ -516,11 +374,11 @@ HTML = """
                 case 'authorized':
                     await loadAuthorizedMacs();
                     break;
-                case 'blocked':
-                    await loadBlockedDevices();
+                case 'packets':
+                    await loadPacketLog();
                     break;
-                case 'threats':
-                    await loadThreatLog();
+                case 'logs':
+                    // Already loaded via addLog
                     break;
             }
         }
@@ -529,23 +387,30 @@ HTML = """
         async function loadDevices() {
             try {
                 const devicesRes = await fetch('/api/devices');
+                if (!devicesRes.ok) throw new Error(`HTTP ${devicesRes.status}`);
                 const devices = await devicesRes.json();
                 
                 const tbody = document.getElementById('deviceTable');
+                
+                if (devices.length === 0) {
+                    tbody.innerHTML = `
+                        <tr><td colspan="7" style="text-align: center; padding: 20px; color: #94a3b8;">
+                            No devices detected yet. Send a test packet above or wait for ESP32 packets.
+                        </td></tr>`;
+                    return;
+                }
+                
                 tbody.innerHTML = '';
                 
                 devices.forEach(device => {
                     const row = tbody.insertRow();
                     
-                    // Calculate packet rate
-                    const rate = device.packet_rate ? device.packet_rate.toFixed(1) : '0.0';
+                    // Format last seen time
+                    const lastSeen = new Date(device.last_seen).toLocaleTimeString();
                     
                     // Determine status
                     let statusClass, statusText;
-                    if (device.blocked) {
-                        statusClass = 'status-blocked';
-                        statusText = 'BLOCKED';
-                    } else if (device.authorized) {
+                    if (device.authorized) {
                         statusClass = 'status-authorized';
                         statusText = 'AUTHORIZED';
                     } else {
@@ -553,28 +418,17 @@ HTML = """
                         statusText = 'UNAUTHORIZED';
                     }
                     
-                    // Determine threat level
-                    let threatClass = '';
-                    if (device.threat_level === 'critical') threatClass = 'critical';
-                    if (device.threat_level === 'warning') threatClass = 'warning';
-                    
                     row.innerHTML = `
                         <td><code style="font-family: monospace;">${device.mac}</code></td>
                         <td>${device.rssi || -99} dBm</td>
                         <td>${device.channel || 0}</td>
                         <td>${device.packet_count || 1}</td>
-                        <td>${rate} pps</td>
-                        <td><span class="status ${statusClass} ${threatClass}">${statusText}</span></td>
+                        <td>${lastSeen}</td>
+                        <td><span class="status ${statusClass}">${statusText}</span></td>
                         <td>
                             <button class="btn ${device.authorized ? 'btn-unauthorize' : 'btn-authorize'}" 
                                     onclick="toggleAuthorization('${device.mac}')">
                                 ${device.authorized ? 'Remove Auth' : 'Authorize'}
-                            </button>
-                        </td>
-                        <td>
-                            <button class="btn ${device.blocked ? 'btn-unblock' : 'btn-block'}" 
-                                    onclick="toggleBlock('${device.mac}')">
-                                ${device.blocked ? 'Unblock' : 'Block'}
                             </button>
                         </td>
                     `;
@@ -582,6 +436,7 @@ HTML = """
                 
             } catch (error) {
                 console.error('Error loading devices:', error);
+                addLog('error', `Failed to load devices: ${error.message}`);
             }
         }
         
@@ -589,16 +444,25 @@ HTML = """
         async function loadAuthorizedMacs() {
             try {
                 const authRes = await fetch('/api/authorized');
+                if (!authRes.ok) throw new Error(`HTTP ${authRes.status}`);
                 const authorized = await authRes.json();
                 
                 const tbody = document.getElementById('authorizedTable');
                 tbody.innerHTML = '';
                 
+                if (authorized.length === 0) {
+                    tbody.innerHTML = `
+                        <tr><td colspan="3" style="text-align: center; padding: 20px; color: #94a3b8;">
+                            No authorized MACs. Add some using the form above.
+                        </td></tr>`;
+                    return;
+                }
+                
                 authorized.forEach(mac => {
                     const row = tbody.insertRow();
                     row.innerHTML = `
                         <td><code style="font-family: monospace;">${mac.mac}</code></td>
-                        <td>${mac.added_at || 'Unknown'}</td>
+                        <td><span class="status status-authorized">AUTHORIZED</span></td>
                         <td>
                             <button class="btn btn-unauthorize" onclick="removeAuthorizedMac('${mac.mac}')">
                                 Remove
@@ -609,57 +473,96 @@ HTML = """
                 
             } catch (error) {
                 console.error('Error loading authorized MACs:', error);
+                addLog('error', `Failed to load authorized MACs: ${error.message}`);
             }
         }
         
-        // Load blocked devices
-        async function loadBlockedDevices() {
+        // Load packet log
+        async function loadPacketLog() {
             try {
-                const blockedRes = await fetch('/api/blocked');
-                const blocked = await blockedRes.json();
+                const packetsRes = await fetch('/api/packets');
+                if (!packetsRes.ok) throw new Error(`HTTP ${packetsRes.status}`);
+                const packets = await packetsRes.json();
                 
-                const tbody = document.getElementById('blockedTable');
-                tbody.innerHTML = '';
+                const logDiv = document.getElementById('packetLog');
+                logDiv.innerHTML = '';
                 
-                blocked.forEach(device => {
-                    const row = tbody.insertRow();
-                    row.innerHTML = `
-                        <td><code style="font-family: monospace;">${device.mac}</code></td>
-                        <td>${device.blocked_at || 'Unknown'}</td>
-                        <td>${device.reason || 'Manual block'}</td>
-                        <td>
-                            <button class="btn btn-unblock" onclick="unblockDevice('${device.mac}')">
-                                Unblock
-                            </button>
-                        </td>
-                    `;
-                });
-                
-            } catch (error) {
-                console.error('Error loading blocked devices:', error);
-            }
-        }
-        
-        // Load threat log
-        async function loadThreatLog() {
-            try {
-                const threatsRes = await fetch('/api/threats');
-                const threats = await threatsRes.json();
-                
-                const logDiv = document.getElementById('threatLog');
-                
-                // Clear existing logs (keep first info message)
-                while (logDiv.children.length > 1) {
-                    logDiv.removeChild(logDiv.lastChild);
+                if (packets.length === 0) {
+                    logDiv.innerHTML = `
+                        <div class="log-entry info">
+                            <div class="log-time">--:--:--</div>
+                            <div class="log-message">No packets received yet</div>
+                        </div>`;
+                    return;
                 }
                 
-                // Add new threat logs
-                threats.forEach(threat => {
-                    addLogEntry(threat.severity || 'info', threat.message);
+                packets.forEach(packet => {
+                    const entry = document.createElement('div');
+                    entry.className = 'log-entry info';
+                    
+                    const time = new Date(packet.timestamp).toLocaleTimeString();
+                    entry.innerHTML = `
+                        <div class="log-time">${time}</div>
+                        <div class="log-message">
+                            📦 MAC: ${packet.mac} | RSSI: ${packet.rssi}dBm | Channel: ${packet.channel}
+                        </div>
+                    `;
+                    
+                    logDiv.appendChild(entry);
                 });
                 
             } catch (error) {
-                console.error('Error loading threats:', error);
+                console.error('Error loading packets:', error);
+                addLog('error', `Failed to load packets: ${error.message}`);
+            }
+        }
+        
+        // Send test packet
+        async function sendTestPacket() {
+            const mac = document.getElementById('testMac').value.trim().toUpperCase();
+            const rssi = document.getElementById('testRSSI').value;
+            const channel = document.getElementById('testChannel').value;
+            const resultDiv = document.getElementById('testResult');
+            
+            // Validate MAC
+            if (!mac.match(/^([0-9A-F]{2}:){5}[0-9A-F]{2}$/)) {
+                resultDiv.innerHTML = '<span style="color: #ef4444;">❌ Invalid MAC format. Use AA:BB:CC:DD:EE:FF</span>';
+                return;
+            }
+            
+            try {
+                resultDiv.innerHTML = '<span style="color: #f59e0b;">⏳ Sending test packet...</span>';
+                
+                const response = await fetch('/api/packet', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({
+                        sensor_id: 'manual_test',
+                        mac: mac,
+                        rssi: parseInt(rssi),
+                        channel: parseInt(channel),
+                        timestamp: Date.now()
+                    })
+                });
+                
+                const data = await response.json();
+                
+                if (response.ok) {
+                    resultDiv.innerHTML = `<span style="color: #10b981;">✅ Packet sent successfully! Packet ID: ${data.packet_id}</span>`;
+                    addLog('success', `Test packet sent: ${mac}`);
+                    
+                    // Refresh devices immediately
+                    setTimeout(loadDevices, 500);
+                    setTimeout(loadDashboard, 500);
+                } else {
+                    resultDiv.innerHTML = `<span style="color: #ef4444;">❌ Error: ${data.error || 'Unknown error'}</span>`;
+                    addLog('error', `Failed to send packet: ${data.error}`);
+                }
+                
+            } catch (error) {
+                console.error('Error sending test packet:', error);
+                resultDiv.innerHTML = `<span style="color: #ef4444;">❌ Network error: ${error.message}</span>`;
+                addLog('error', `Network error: ${error.message}`);
             }
         }
         
@@ -677,18 +580,25 @@ HTML = """
                 const response = await fetch(`/api/authorize/${mac}`, {
                     method: 'POST'
                 });
+                
                 const result = await response.json();
                 
                 if (response.ok) {
                     macInput.value = '';
+                    addLog('success', `Authorized MAC: ${mac}`);
                     loadAuthorizedMacs();
                     loadDashboard();
-                    addLogEntry('info', `✅ Authorized MAC: ${mac}`);
+                    
+                    // Show success message
+                    alert(`✅ MAC ${mac} added to authorized list and saved to server.py`);
                 } else {
-                    alert(result.error || 'Failed to authorize MAC');
+                    alert(`❌ Error: ${result.error || 'Failed to authorize MAC'}`);
+                    addLog('error', `Failed to authorize MAC: ${result.error}`);
                 }
             } catch (error) {
                 console.error('Error authorizing MAC:', error);
+                alert(`❌ Network error: ${error.message}`);
+                addLog('error', `Network error: ${error.message}`);
             }
         }
         
@@ -702,12 +612,31 @@ HTML = """
                 });
                 
                 if (response.ok) {
+                    addLog('warning', `Removed authorization: ${mac}`);
                     loadAuthorizedMacs();
                     loadDashboard();
-                    addLogEntry('warning', `⚠️ Removed authorization: ${mac}`);
                 }
             } catch (error) {
                 console.error('Error removing authorized MAC:', error);
+                addLog('error', `Failed to remove MAC: ${error.message}`);
+            }
+        }
+        
+        // Reload authorized MACs from file
+        async function reloadAuthorizedMacs() {
+            try {
+                const response = await fetch('/api/reload_authorized', {
+                    method: 'POST'
+                });
+                
+                if (response.ok) {
+                    addLog('info', 'Reloaded authorized MACs from file');
+                    loadAuthorizedMacs();
+                    alert('✅ Reloaded authorized MACs from file');
+                }
+            } catch (error) {
+                console.error('Error reloading authorized MACs:', error);
+                addLog('error', `Failed to reload MACs: ${error.message}`);
             }
         }
         
@@ -717,95 +646,25 @@ HTML = """
                 const response = await fetch(`/api/device/${mac}/toggle_auth`, {
                     method: 'POST'
                 });
+                
                 const result = await response.json();
                 
-                loadDashboard();
-                addLogEntry('info', 
-                    result.authorized ? `✅ Authorized: ${mac}` : `⚠️ Unauthorized: ${mac}`
-                );
+                if (response.ok) {
+                    addLog('info', 
+                        result.authorized ? `Authorized: ${mac}` : `Unauthorized: ${mac}`
+                    );
+                    loadDevices();
+                    loadAuthorizedMacs();
+                }
             } catch (error) {
                 console.error('Error toggling authorization:', error);
-            }
-        }
-        
-        // Toggle block
-        async function toggleBlock(mac) {
-            try {
-                const response = await fetch(`/api/device/${mac}/toggle_block`, {
-                    method: 'POST'
-                });
-                const result = await response.json();
-                
-                loadDashboard();
-                addLogEntry(result.status === 'blocked' ? 'critical' : 'info',
-                    result.status === 'blocked' ? `🚫 Blocked: ${mac}` : `✅ Unblocked: ${mac}`
-                );
-            } catch (error) {
-                console.error('Error toggling block:', error);
-            }
-        }
-        
-        // Unblock device
-        async function unblockDevice(mac) {
-            try {
-                const response = await fetch(`/api/unblock/${mac}`, {
-                    method: 'POST'
-                });
-                
-                if (response.ok) {
-                    loadBlockedDevices();
-                    loadDashboard();
-                    addLogEntry('info', `✅ Unblocked: ${mac}`);
-                }
-            } catch (error) {
-                console.error('Error unblocking device:', error);
-            }
-        }
-        
-        // Update settings
-        async function updateSettings() {
-            const threshold = document.getElementById('blockThreshold').value;
-            const duration = document.getElementById('blockDuration').value;
-            
-            try {
-                const response = await fetch('/api/settings', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({
-                        threshold: parseInt(threshold),
-                        duration: parseInt(duration)
-                    })
-                });
-                
-                if (response.ok) {
-                    addLogEntry('info', '✅ Settings updated');
-                }
-            } catch (error) {
-                console.error('Error updating settings:', error);
-            }
-        }
-        
-        // Clear all blocks
-        async function clearAllBlocks() {
-            if (!confirm('Clear ALL iptables blocks? This will unblock all devices.')) return;
-            
-            try {
-                const response = await fetch('/api/clear_blocks', {
-                    method: 'POST'
-                });
-                
-                if (response.ok) {
-                    loadDashboard();
-                    addLogEntry('info', '🧹 Cleared all iptables blocks');
-                }
-            } catch (error) {
-                console.error('Error clearing blocks:', error);
+                addLog('error', `Failed to toggle authorization: ${error.message}`);
             }
         }
         
         // Add log entry
-        function addLogEntry(type, message) {
-            const logDiv = document.getElementById('threatLog');
+        function addLog(type, message) {
+            const logDiv = document.getElementById('systemLog');
             const entry = document.createElement('div');
             entry.className = `log-entry ${type}`;
             
@@ -822,40 +681,23 @@ HTML = """
             while (logDiv.children.length > 51) {
                 logDiv.removeChild(logDiv.lastChild);
             }
+            
+            // Add to activity log array
+            activityLog.unshift({type, message, time});
+            if (activityLog.length > 100) activityLog.pop();
         }
         
-        // Auto-refresh every 3 seconds
-        setInterval(loadDashboard, 3000);
+        // Auto-refresh every 5 seconds
+        setInterval(loadDashboard, 5000);
         
         // Initial load
         loadDashboard();
+        addLog('info', 'Dashboard loaded successfully');
+        addLog('info', 'Send test packets using the manual test section');
     </script>
 </body>
 </html>
 """
-
-# ========== THREAT LOG ==========
-threat_log = []
-
-def log_threat(mac, threat_type, severity, description):
-    """Log a threat detection"""
-    entry = {
-        'timestamp': datetime.now().isoformat(),
-        'mac': mac,
-        'type': threat_type,
-        'severity': severity,
-        'message': description
-    }
-    threat_log.append(entry)
-    
-    # Keep only last 100 threats
-    if len(threat_log) > 100:
-        threat_log.pop(0)
-    
-    # Print to console
-    print(f"⚠️ THREAT: {mac} - {threat_type} ({severity}): {description}")
-    
-    return entry
 
 # ========== ROUTES ==========
 @app.route('/')
@@ -875,17 +717,19 @@ def receive_packet():
         mac = data.get('mac', '00:00:00:00:00:00')
         sensor_id = data.get('sensor_id', 'unknown')
         
-        print(f"📦 Packet from {client_ip} - MAC: {mac}")
+        print(f"📦 Packet received from {client_ip}")
+        print(f"   MAC: {mac}, RSSI: {data.get('rssi')}, Channel: {data.get('channel')}")
         
         # Add timestamp
         data['received_at'] = datetime.now().isoformat()
         data['client_ip'] = client_ip
+        data['timestamp'] = datetime.now().isoformat()
         
         # Store packet
         packets.append(data)
         
-        # Keep last 1000 packets only
-        if len(packets) > 1000:
+        # Keep last 100 packets only
+        if len(packets) > 100:
             packets.pop(0)
         
         # Update device info
@@ -898,84 +742,37 @@ def receive_packet():
                 'rssi': data.get('rssi', -99),
                 'channel': data.get('channel', 0),
                 'authorized': mac in authorized_macs,
-                'threat_level': 'normal',
                 'sensor': sensor_id
             }
-            print(f"🆕 New device: {mac}")
+            print(f"🆕 New device detected: {mac}")
         else:
             devices[mac]['last_seen'] = datetime.now().isoformat()
             devices[mac]['packet_count'] += 1
             devices[mac]['rssi'] = data.get('rssi', devices[mac]['rssi'])
             devices[mac]['channel'] = data.get('channel', devices[mac]['channel'])
         
-        # Check if blocked in iptables
-        iptables_blocked = iptables.is_blocked(mac)
-        devices[mac]['blocked'] = iptables_blocked or (mac in blocked_macs)
-        
-        # Run threat detection
-        threats = threat_detector.analyze_packet(data)
-        
-        # Process threats
-        auto_blocked = False
-        for threat in threats:
-            # Log the threat
-            log_threat(mac, threat['type'], threat['severity'], threat['description'])
-            
-            # Auto-block for critical threats
-            if threat['severity'] == 'critical' and not devices[mac]['authorized']:
-                if iptables.block_mac(mac, BLOCK_DURATION):
-                    devices[mac]['blocked'] = True
-                    blocked_macs.add(mac)
-                    auto_blocked = True
-                    print(f"🚫 AUTO-BLOCKED {mac} - {threat['description']}")
-        
-        # Update threat level
-        if threats:
-            devices[mac]['threat_level'] = threats[0]['severity']
-        
-        # Calculate packet rate
-        current_time = time.time()
-        if mac not in packet_rates:
-            packet_rates[mac] = []
-        packet_rates[mac].append(current_time)
-        
-        # Clean old timestamps (keep last 30 seconds)
-        packet_rates[mac] = [t for t in packet_rates[mac] if current_time - t < 30]
-        
-        print(f"✅ Packet #{len(packets)} from {mac} processed")
+        print(f"✅ Packet #{len(packets)} stored successfully")
         
         return jsonify({
             'status': 'received',
             'packet_id': len(packets),
-            'blocked': devices[mac]['blocked'],
-            'authorized': devices[mac]['authorized'],
-            'auto_blocked': auto_blocked,
-            'threats_detected': len(threats),
-            'message': f'Packet processed, {len(threats)} threats detected'
+            'authorized': mac in authorized_macs,
+            'message': f'Packet from {mac} received successfully'
         })
         
     except Exception as e:
-        print(f"❌ Error: {e}")
+        print(f"❌ Error processing packet: {e}")
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/devices')
 def get_devices():
     """Get list of all detected devices"""
     device_list = []
-    current_time = time.time()
     
     for mac, info in devices.items():
         # Only include devices seen in last hour
         last_seen = datetime.fromisoformat(info['last_seen'].replace('Z', '+00:00'))
         if datetime.now() - last_seen < timedelta(hours=1):
-            
-            # Calculate packet rate
-            rate = 0.0
-            if mac in packet_rates:
-                # Count packets in last 10 seconds
-                recent_packets = [t for t in packet_rates[mac] if current_time - t < 10]
-                rate = len(recent_packets) / 10.0
-            
             device_list.append({
                 'mac': mac,
                 'first_seen': info['first_seen'],
@@ -984,22 +781,41 @@ def get_devices():
                 'rssi': info.get('rssi', -99),
                 'channel': info.get('channel', 0),
                 'authorized': info.get('authorized', False),
-                'blocked': info.get('blocked', False),
-                'threat_level': info.get('threat_level', 'normal'),
-                'packet_rate': rate,
                 'sensor': info.get('sensor', 'unknown')
             })
     
+    # Sort by last seen (newest first)
+    device_list.sort(key=lambda x: x['last_seen'], reverse=True)
+    
     return jsonify(device_list)
+
+@app.route('/api/packets')
+def get_packets():
+    """Get recent packets"""
+    # Return last 50 packets
+    recent_packets = packets[-50:]
+    
+    # Format for display
+    formatted_packets = []
+    for p in recent_packets:
+        formatted_packets.append({
+            'mac': p.get('mac', 'unknown'),
+            'rssi': p.get('rssi', -99),
+            'channel': p.get('channel', 0),
+            'timestamp': p.get('received_at', p.get('timestamp', '')),
+            'sensor': p.get('sensor_id', 'unknown')
+        })
+    
+    return jsonify(formatted_packets[::-1])  # Reverse to show newest first
 
 @app.route('/api/authorized')
 def get_authorized():
     """Get list of authorized MACs"""
     auth_list = []
-    for mac in authorized_macs:
+    for mac in sorted(authorized_macs):
         auth_list.append({
             'mac': mac,
-            'added_at': 'Unknown'  # Could store timestamps
+            'added_at': 'From server.py'  # Could store actual timestamps
         })
     return jsonify(auth_list)
 
@@ -1007,18 +823,21 @@ def get_authorized():
 def authorize_mac(mac):
     """Add MAC to authorized list"""
     mac_upper = mac.upper()
+    
+    # Validate MAC format
+    if not re.match(r'^([0-9A-F]{2}:){5}[0-9A-F]{2}$', mac_upper):
+        return jsonify({'error': 'Invalid MAC format'}), 400
+    
     authorized_macs.add(mac_upper)
     
-    # Unblock if currently blocked
-    if mac_upper in blocked_macs:
-        blocked_macs.discard(mac_upper)
-        iptables.unblock_mac(mac_upper)
-    
+    # Update device if it exists
     if mac_upper in devices:
         devices[mac_upper]['authorized'] = True
-        devices[mac_upper]['blocked'] = False
     
-    print(f"✅ Authorized MAC: {mac_upper}")
+    # Save to file and update server.py
+    save_authorized_macs()
+    
+    print(f"✅ Authorized MAC: {mac_upper} (saved to file)")
     return jsonify({'status': 'authorized', 'mac': mac_upper})
 
 @app.route('/api/unauthorize/<mac>', methods=['POST'])
@@ -1027,10 +846,14 @@ def unauthorize_mac(mac):
     mac_upper = mac.upper()
     authorized_macs.discard(mac_upper)
     
+    # Update device if it exists
     if mac_upper in devices:
         devices[mac_upper]['authorized'] = False
     
-    print(f"⚠️ Unauthorized MAC: {mac_upper}")
+    # Save to file and update server.py
+    save_authorized_macs()
+    
+    print(f"⚠️ Unauthorized MAC: {mac_upper} (updated in file)")
     return jsonify({'status': 'unauthorized', 'mac': mac_upper})
 
 @app.route('/api/device/<mac>/toggle_auth', methods=['POST'])
@@ -1049,67 +872,18 @@ def toggle_authorization(mac):
         if mac_upper in devices:
             devices[mac_upper]['authorized'] = True
     
+    # Save to file
+    save_authorized_macs()
+    
     print(f"🔄 Toggled authorization for {mac_upper}: {status}")
     return jsonify({'status': status, 'authorized': status == 'authorized', 'mac': mac_upper})
 
-@app.route('/api/device/<mac>/toggle_block', methods=['POST'])
-def toggle_block(mac):
-    """Toggle block status for a device"""
-    mac_upper = mac.upper()
-    
-    if mac_upper in blocked_macs or iptables.is_blocked(mac_upper):
-        # Unblock
-        blocked_macs.discard(mac_upper)
-        iptables.unblock_mac(mac_upper)
-        status = 'unblocked'
-        if mac_upper in devices:
-            devices[mac_upper]['blocked'] = False
-    else:
-        # Block
-        blocked_macs.add(mac_upper)
-        iptables.block_mac(mac_upper, BLOCK_DURATION)
-        status = 'blocked'
-        if mac_upper in devices:
-            devices[mac_upper]['blocked'] = True
-    
-    print(f"🔄 Toggled block for {mac_upper}: {status}")
-    return jsonify({'status': status, 'blocked': status == 'blocked', 'mac': mac_upper})
-
-@app.route('/api/unblock/<mac>', methods=['POST'])
-def unblock_device(mac):
-    """Unblock a specific device"""
-    mac_upper = mac.upper()
-    
-    blocked_macs.discard(mac_upper)
-    iptables.unblock_mac(mac_upper)
-    
-    if mac_upper in devices:
-        devices[mac_upper]['blocked'] = False
-    
-    print(f"✅ Unblocked device: {mac_upper}")
-    return jsonify({'status': 'unblocked', 'mac': mac_upper})
-
-@app.route('/api/blocked')
-def get_blocked():
-    """Get list of blocked devices"""
-    blocked_list = []
-    
-    # Get iptables blocked MACs
-    iptables_blocked = iptables.list_blocked()
-    
-    for mac in set(list(blocked_macs) + iptables_blocked):
-        blocked_list.append({
-            'mac': mac,
-            'blocked_at': 'Unknown',  # Could store timestamps
-            'reason': 'Manual block' if mac in blocked_macs else 'Auto-block'
-        })
-    
-    return jsonify(blocked_list)
-
-@app.route('/api/threats')
-def get_threats():
-    """Get threat log"""
-    return jsonify(threat_log[-50:])  # Last 50 threats
+@app.route('/api/reload_authorized', methods=['POST'])
+def reload_authorized():
+    """Reload authorized MACs from file"""
+    load_authorized_macs()
+    print("🔄 Reloaded authorized MACs from file")
+    return jsonify({'status': 'reloaded', 'count': len(authorized_macs)})
 
 @app.route('/api/stats')
 def get_stats():
@@ -1117,7 +891,6 @@ def get_stats():
     # Count devices by status
     total_devices = 0
     authorized_count = 0
-    blocked_count = 0
     unauthorized_count = 0
     
     for info in devices.values():
@@ -1126,58 +899,18 @@ def get_stats():
             total_devices += 1
             if info.get('authorized'):
                 authorized_count += 1
-            elif info.get('blocked'):
-                blocked_count += 1
             else:
                 unauthorized_count += 1
-    
-    # Count iptables blocks
-    iptables_count = len(iptables.list_blocked())
     
     return jsonify({
         'device_count': total_devices,
         'packet_count': len(packets),
         'authorized_count': authorized_count,
-        'blocked_count': max(blocked_count, iptables_count),
         'unauthorized_count': unauthorized_count,
-        'threat_count': len(threat_log),
-        'iptables_blocks': iptables_count,
-        'uptime': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+        'total_authorized': len(authorized_macs),
         'server_ip': get_ip(),
-        'auto_block_threshold': AUTO_BLOCK_THRESHOLD,
-        'block_duration': BLOCK_DURATION
+        'server_time': datetime.now().isoformat()
     })
-
-@app.route('/api/settings', methods=['POST'])
-def update_settings():
-    """Update system settings"""
-    global AUTO_BLOCK_THRESHOLD, BLOCK_DURATION
-    
-    data = request.json
-    if data.get('threshold'):
-        AUTO_BLOCK_THRESHOLD = int(data['threshold'])
-    if data.get('duration'):
-        BLOCK_DURATION = int(data['duration'])
-    
-    print(f"⚙️ Updated settings: threshold={AUTO_BLOCK_THRESHOLD}, duration={BLOCK_DURATION}")
-    return jsonify({
-        'status': 'updated',
-        'threshold': AUTO_BLOCK_THRESHOLD,
-        'duration': BLOCK_DURATION
-    })
-
-@app.route('/api/clear_blocks', methods=['POST'])
-def clear_all_blocks():
-    """Clear all iptables blocks"""
-    iptables.cleanup_rules()
-    blocked_macs.clear()
-    
-    # Update device status
-    for mac in devices:
-        devices[mac]['blocked'] = False
-    
-    print("🧹 Cleared all iptables blocks")
-    return jsonify({'status': 'cleared'})
 
 @app.route('/api/test', methods=['POST'])
 def test_endpoint():
@@ -1187,6 +920,7 @@ def test_endpoint():
     return jsonify({
         'status': 'test_ok',
         'message': 'Server is working!',
+        'received_data': data,
         'timestamp': datetime.now().isoformat()
     })
 
@@ -1207,27 +941,21 @@ def get_ip():
 # ========== MAIN ==========
 if __name__ == '__main__':
     print("\n" + "="*70)
-    print("🚀 WIDS SERVER WITH IPTABLES AUTO-BLOCKING")
+    print("🚀 WIDS SERVER - FIXED VERSION")
     print("="*70)
     print(f"📊 Dashboard: http://{get_ip()}:8000")
     print(f"🏠 Local:     http://127.0.0.1:8000")
-    print("\n🛡️ Features:")
-    print("  • iptables auto-blocking for threats")
-    print("  • MAC address authorization whitelist")
-    print("  • Threat detection with packet rate analysis")
-    print("  • Real-time dashboard with threat logs")
-    print("\n📡 API Endpoints:")
-    print("  GET  /                         - Dashboard")
-    print("  POST /api/packet               - Receive ESP32 packets")
-    print("  GET  /api/devices              - List detected devices")
-    print("  GET  /api/authorized           - List authorized MACs")
-    print("  GET  /api/blocked              - List blocked devices")
-    print("  GET  /api/threats              - Threat detection log")
-    print("  POST /api/authorize/<mac>      - Authorize a MAC")
-    print("  POST /api/device/<mac>/toggle_block - Block/Unblock")
-    print("  POST /api/clear_blocks         - Clear all iptables blocks")
-    print("\n⚠️ Note: Requires sudo privileges for iptables commands")
-    print("Run with: sudo python3 server.py (or add user to sudoers)")
+    print(f"✅ Loaded {len(authorized_macs)} authorized MACs from file")
+    print("\n📡 Features:")
+    print("  • Dashboard shows real-time devices")
+    print("  • Manual packet testing section")
+    print("  • MAC authorization management")
+    print("  • Authorized MACs saved to server.py file")
+    print("\n🔧 To test the system:")
+    print("  1. Open dashboard in browser")
+    print("  2. Use 'Manual Packet Test' section")
+    print("  3. Add MACs to authorized list")
+    print("  4. MACs are saved to server.py automatically")
     print("\n⏳ Waiting for ESP32 packets...")
     print("="*70 + "\n")
     
