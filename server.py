@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-MINIMAL WIDS SERVER
-No ML, just packet collection and dashboard
+FIXED WIDS SERVER - Simple Version
+No SocketIO, just Flask
 """
 from flask import Flask, request, jsonify, render_template_string
 from datetime import datetime, timedelta
@@ -71,12 +71,16 @@ HTML = """
         
         /* Footer */
         .footer { text-align: center; padding: 15px; color: #64748b; font-size: 12px; border-top: 1px solid #334155; margin-top: 20px; }
+        
+        /* Refresh button */
+        .refresh-btn { background: #3b82f6; color: white; border: none; padding: 8px 16px; border-radius: 4px; cursor: pointer; margin: 10px; }
     </style>
 </head>
 <body>
     <div class="header">
         <h1>📡 WIDS Dashboard</h1>
         <p>Wireless Intrusion Detection System | Real-time Monitoring</p>
+        <button class="refresh-btn" onclick="loadDashboard()">🔄 Refresh</button>
     </div>
     
     <div class="stats">
@@ -126,7 +130,12 @@ HTML = """
             <div class="panel-header">
                 <h3>📝 Recent Activity</h3>
             </div>
-            <div id="activityLog" style="max-height: 500px; overflow-y: auto;"></div>
+            <div id="activityLog" style="max-height: 500px; overflow-y: auto;">
+                <div class="log-entry new">
+                    <div class="log-time" id="currentTime">--:--:--</div>
+                    <div class="log-message">✅ Dashboard loaded</div>
+                </div>
+            </div>
         </div>
     </div>
     
@@ -137,9 +146,19 @@ HTML = """
     <script>
         let lastUpdateTime = '--:--:--';
         
-        // Load initial data
+        // Update current time
+        function updateTime() {
+            const now = new Date();
+            document.getElementById('currentTime').textContent = now.toLocaleTimeString();
+        }
+        setInterval(updateTime, 1000);
+        updateTime();
+        
+        // Load dashboard data
         async function loadDashboard() {
             try {
+                console.log('Loading dashboard...');
+                
                 // Load stats
                 const statsRes = await fetch('/api/stats');
                 const stats = await statsRes.json();
@@ -188,14 +207,18 @@ HTML = """
                 lastUpdateTime = new Date().toLocaleTimeString();
                 document.getElementById('lastUpdate').textContent = lastUpdateTime;
                 
+                // Add log entry
+                addLogEntry('🔄 Dashboard refreshed');
+                
             } catch (error) {
                 console.error('Error loading dashboard:', error);
+                addLogEntry('❌ Error loading data: ' + error.message);
             }
         }
         
         // Toggle block/unblock
         async function toggleBlock(mac) {
-            const action = confirm(`Are you sure you want to ${mac}?`);
+            const action = confirm(`Are you sure you want to ${mac.includes('blocked') ? 'unblock' : 'block'} device ${mac}?`);
             if (!action) return;
             
             try {
@@ -205,12 +228,13 @@ HTML = """
                 const result = await response.json();
                 
                 // Add to activity log
-                addLogEntry(`${result.action === 'blocked' ? '🚫 Blocked' : '✅ Unblocked'} device: ${mac}`);
+                addLogEntry(`${result.status === 'blocked' ? '🚫 Blocked' : '✅ Unblocked'} device: ${mac}`);
                 
                 // Reload dashboard
                 loadDashboard();
             } catch (error) {
                 console.error('Error toggling block:', error);
+                addLogEntry('❌ Error toggling block: ' + error.message);
             }
         }
         
@@ -238,32 +262,24 @@ HTML = """
             setTimeout(() => entry.classList.remove('new'), 2000);
         }
         
-        // Auto-refresh every 3 seconds
-        setInterval(loadDashboard, 3000);
+        // Auto-refresh every 5 seconds
+        setInterval(loadDashboard, 5000);
         
         // Initial load
         loadDashboard();
         
-        // WebSocket for real-time updates
-        const ws = new WebSocket(`ws://${window.location.host}/ws`);
-        
-        ws.onmessage = (event) => {
-            const data = JSON.parse(event.data);
+        // Simulate packets for testing
+        setInterval(() => {
+            const testMacs = ['AA:BB:CC:DD:EE:FF', '11:22:33:44:55:66', 'FE:DC:BA:98:76:54'];
+            const randomMac = testMacs[Math.floor(Math.random() * testMacs.length)];
+            const rssi = -50 - Math.floor(Math.random() * 40);
+            const channel = [1, 6, 11, 36, 48][Math.floor(Math.random() * 5)];
             
-            if (data.type === 'new_packet') {
-                addLogEntry(`📡 Packet from ${data.mac} (Ch:${data.channel}, RSSI:${data.rssi}dBm)`);
+            // Only add test entries if no real data
+            if (document.getElementById('totalPackets').textContent === '0') {
+                addLogEntry(`📡 Test packet from ${randomMac} (Ch:${channel}, RSSI:${rssi}dBm)`);
             }
-            else if (data.type === 'device_blocked') {
-                addLogEntry(`🚫 Auto-blocked: ${data.mac} - ${data.reason}`);
-            }
-            else if (data.type === 'sensor_connected') {
-                addLogEntry(`🔌 Sensor connected: ${data.sensor_id}`);
-            }
-        };
-        
-        // Add some initial log entries
-        addLogEntry('✅ Dashboard loaded successfully');
-        addLogEntry('🔍 Starting wireless monitoring...');
+        }, 10000); // Every 10 seconds
     </script>
 </body>
 </html>
@@ -282,6 +298,8 @@ def receive_packet():
         data = request.json
         if not data:
             return jsonify({'error': 'No data'}), 400
+        
+        print(f"📦 Received packet from ESP32: {data.get('sensor_id', 'unknown')}")
         
         # Add timestamp
         data['received_at'] = datetime.now().isoformat()
@@ -315,29 +333,24 @@ def receive_packet():
                 'blocked': mac in blocked_macs,
                 'sensor': sensor_id
             }
+            print(f"🆕 New device detected: {mac}")
         else:
             devices[mac]['last_seen'] = datetime.now().isoformat()
             devices[mac]['packet_count'] += 1
             devices[mac]['rssi'] = data.get('rssi', devices[mac]['rssi'])
             devices[mac]['channel'] = data.get('channel', devices[mac]['channel'])
         
-        # Broadcast new packet via WebSocket
-        broadcast_ws({
-            'type': 'new_packet',
-            'mac': mac,
-            'channel': data.get('channel', 0),
-            'rssi': data.get('rssi', -99),
-            'sensor': sensor_id
-        })
+        print(f"✅ Packet #{len(packets)} from {mac} stored")
         
         return jsonify({
             'status': 'received',
             'packet_id': len(packets),
-            'blocked': mac in blocked_macs
+            'blocked': mac in blocked_macs,
+            'message': f'Packet from {mac} received successfully'
         })
         
     except Exception as e:
-        print(f"Error: {e}")
+        print(f"❌ Error: {e}")
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/devices')
@@ -369,18 +382,13 @@ def toggle_block(mac):
         if mac in devices:
             devices[mac]['blocked'] = False
         action = 'unblocked'
+        print(f"✅ Unblocked device: {mac}")
     else:
         blocked_macs.add(mac)
         if mac in devices:
             devices[mac]['blocked'] = True
         action = 'blocked'
-    
-    # Broadcast via WebSocket
-    broadcast_ws({
-        'type': 'device_blocked' if action == 'blocked' else 'device_unblocked',
-        'mac': mac,
-        'action': action
-    })
+        print(f"🚫 Blocked device: {mac}")
     
     return jsonify({'status': action, 'mac': mac})
 
@@ -407,7 +415,8 @@ def get_stats():
         'blocked_count': len(blocked_macs),
         'sensor_count': active_sensors,
         'uptime': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-        'server_time': datetime.now().isoformat()
+        'server_time': datetime.now().isoformat(),
+        'server_ip': get_ip()
     })
 
 @app.route('/api/sensors')
@@ -426,18 +435,17 @@ def get_sensors():
     
     return jsonify(sensor_list)
 
-# ========== WEB SOCKET ==========
-from flask_socketio import SocketIO, emit
-socketio = SocketIO(app, cors_allowed_origins="*")
-
-@socketio.on('connect')
-def handle_connect():
-    print(f"Client connected: {request.sid}")
-    emit('connected', {'message': 'Connected to WIDS server'})
-
-def broadcast_ws(data):
-    """Broadcast data to all WebSocket clients"""
-    socketio.emit('update', data)
+@app.route('/api/test', methods=['POST'])
+def test_endpoint():
+    """Test endpoint for debugging"""
+    data = request.json or {}
+    print(f"Test endpoint called with: {data}")
+    return jsonify({
+        'status': 'test_ok',
+        'message': 'Server is working!',
+        'received_data': data,
+        'timestamp': datetime.now().isoformat()
+    })
 
 # ========== UTILITIES ==========
 def get_ip():
@@ -455,18 +463,23 @@ def get_ip():
 
 # ========== MAIN ==========
 if __name__ == '__main__':
-    print("\n" + "="*50)
-    print("🚀 WIDS SERVER STARTING")
-    print("="*50)
-    print(f"Dashboard: http://{get_ip()}:8000")
-    print(f"Local:     http://127.0.0.1:8000")
-    print("\nAPI Endpoints:")
-    print("  GET  /              - Dashboard")
-    print("  POST /api/packet    - Receive packets")
-    print("  GET  /api/devices   - List devices")
-    print("  GET  /api/stats     - Statistics")
+    print("\n" + "="*60)
+    print("🚀 WIDS SERVER STARTING - SIMPLE VERSION")
+    print("="*60)
+    print(f"📊 Dashboard: http://{get_ip()}:8000")
+    print(f"🏠 Local:     http://127.0.0.1:8000")
+    print("\n📡 API Endpoints:")
+    print("  GET  /                     - Dashboard")
+    print("  POST /api/packet           - Receive ESP32 packets")
+    print("  GET  /api/devices          - List detected devices")
+    print("  GET  /api/stats            - System statistics")
     print("  POST /api/device/<mac>/toggle_block - Block/Unblock")
-    print("\nWaiting for ESP32 packets...")
-    print("="*50 + "\n")
+    print("  POST /api/test             - Test endpoint")
+    print("\n🔧 To test if server is receiving data:")
+    print(f'  curl -X POST http://{get_ip()}:8000/api/packet \\')
+    print('    -H "Content-Type: application/json" \\')
+    print('    -d \'{"sensor_id":"test","mac":"AA:BB:CC:DD:EE:FF","rssi":-65,"channel":6}\'')
+    print("\n⏳ Waiting for ESP32 packets...")
+    print("="*60 + "\n")
     
-    socketio.run(app, host='0.0.0.0', port=8000, debug=True)
+    app.run(host='0.0.0.0', port=8000, debug=True)
