@@ -1,0 +1,168 @@
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+
+// ========== CONFIGURATION ==========
+const char* ssid = "YOUR_WIFI_SSID";
+const char* password = "YOUR_WIFI_PASSWORD";
+const char* serverUrl = "http://YOUR_SERVER_IP:8000/api/packet";
+
+// ========== GLOBAL VARIABLES ==========
+String esp32Mac = "";
+unsigned long lastPacketTime = 0;
+unsigned long packetCount = 0;
+bool wifiConnected = false;
+
+// ========== SETUP ==========
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+  
+  Serial.println("\n\n");
+  Serial.println("========================================");
+  Serial.println("       ESP32 WIDS CLIENT");
+  Serial.println("========================================");
+  
+  // Get MAC address
+  esp32Mac = WiFi.macAddress();
+  Serial.print("ESP32 MAC: ");
+  Serial.println(esp32Mac);
+  
+  // Setup LED
+  pinMode(2, OUTPUT);
+  digitalWrite(2, LOW);
+  
+  // Connect to WiFi
+  connectToWiFi();
+  
+  // Send ready signal
+  Serial.println("\n✅ ESP32_WIDS_READY");
+  Serial.println("📡 Monitoring mode active");
+  Serial.println("📦 Sending simulated packets to server");
+  Serial.println("========================================");
+  
+  // Blink LED to indicate ready
+  for(int i=0; i<5; i++) {
+    digitalWrite(2, HIGH);
+    delay(200);
+    digitalWrite(2, LOW);
+    delay(200);
+  }
+  digitalWrite(2, HIGH);
+}
+
+// ========== MAIN LOOP ==========
+void loop() {
+  // Maintain WiFi connection
+  if (WiFi.status() != WL_CONNECTED) {
+    wifiConnected = false;
+    digitalWrite(2, LOW);
+    Serial.println("❌ WiFi disconnected! Reconnecting...");
+    connectToWiFi();
+  }
+  
+  // Send simulated packet every 5 seconds
+  if (millis() - lastPacketTime > 5000) {
+    if (wifiConnected) {
+      sendSimulatedPacket();
+      lastPacketTime = millis();
+      packetCount++;
+      
+      // Blink LED on packet send
+      digitalWrite(2, LOW);
+      delay(50);
+      digitalWrite(2, HIGH);
+    }
+  }
+  
+  // Send heartbeat every 30 seconds
+  static unsigned long lastHeartbeat = 0;
+  if (millis() - lastHeartbeat > 30000) {
+    Serial.print("💓 Heartbeat - Packets sent: ");
+    Serial.println(packetCount);
+    lastHeartbeat = millis();
+  }
+  
+  delay(100);
+}
+
+// ========== FUNCTIONS ==========
+void connectToWiFi() {
+  Serial.print("Connecting to WiFi: ");
+  Serial.println(ssid);
+  
+  WiFi.begin(ssid, password);
+  
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 30) {
+    delay(500);
+    Serial.print(".");
+    attempts++;
+  }
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    wifiConnected = true;
+    Serial.println("\n✅ WiFi connected!");
+    Serial.print("IP Address: ");
+    Serial.println(WiFi.localIP());
+    Serial.print("Server: ");
+    Serial.println(serverUrl);
+  } else {
+    Serial.println("\n❌ WiFi connection failed!");
+    Serial.println("Please check SSID and password in code.");
+  }
+}
+
+String generateRandomMAC() {
+  char mac[18];
+  snprintf(mac, sizeof(mac), "%02X:%02X:%02X:%02X:%02X:%02X",
+           random(0, 255), random(0, 255), random(0, 255),
+           random(0, 255), random(0, 255), random(0, 255));
+  return String(mac);
+}
+
+void sendSimulatedPacket() {
+  if (!wifiConnected) return;
+  
+  HTTPClient http;
+  http.begin(serverUrl);
+  http.addHeader("Content-Type", "application/json");
+  
+  // Generate simulated device data
+  String randomMAC = generateRandomMAC();
+  int rssi = -40 - random(0, 60);  // -40 to -100 dBm
+  int channel = 1 + random(0, 13); // Channel 1-13
+  
+  // Create JSON
+  StaticJsonDocument<256> doc;
+  doc["sensor_id"] = "esp32_wids";
+  doc["mac"] = randomMAC;
+  doc["rssi"] = rssi;
+  doc["channel"] = channel;
+  doc["timestamp"] = millis();
+  doc["esp32_mac"] = esp32Mac;
+  
+  String jsonPayload;
+  serializeJson(doc, jsonPayload);
+  
+  // Print to Serial
+  Serial.print("📤 Sending: MAC:");
+  Serial.print(randomMAC);
+  Serial.print(" RSSI:");
+  Serial.print(rssi);
+  Serial.print("dBm Channel:");
+  Serial.println(channel);
+  
+  // Send to server
+  int httpCode = http.POST(jsonPayload);
+  
+  if (httpCode > 0) {
+    Serial.print("✅ Server response: ");
+    Serial.println(httpCode);
+  } else {
+    Serial.print("❌ Failed to send: ");
+    Serial.println(httpCode);
+  }
+  
+  http.end();
+}
