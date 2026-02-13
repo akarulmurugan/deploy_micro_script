@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
 WIDS SERVER WITH AUTO-BLOCKING & EMAIL NOTIFICATIONS
+Run with: sudo python3 server.py
 """
 from flask import Flask, request, jsonify, render_template_string
 from datetime import datetime, timedelta
@@ -15,11 +16,12 @@ from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 import sqlite3
 from collections import defaultdict
+import socket
 
 app = Flask(__name__)
 
-# ========== CONFIGURATION ==========
-YOUR_SSID = "Airtel_sath_0300"  # Your router SSID
+# ========== CONFIGURATION - CHANGE THESE VALUES ==========
+YOUR_SSID = "Airtel_sath_0300"  # Your router SSID to protect
 
 # Email Configuration (REQUIRED for notifications)
 EMAIL_CONFIG = {
@@ -28,24 +30,26 @@ EMAIL_CONFIG = {
     'smtp_port': 587,
     'sender_email': 'your_email@gmail.com',  # CHANGE THIS
     'sender_password': 'your_app_password',  # CHANGE THIS (Google App Password)
-    'recipient_email': 'your_alerts_email@gmail.com'  # CHANGE THIS
+    'recipient_email': 'your_email@gmail.com'  # CHANGE THIS
 }
 
 # Files and paths
 AUTHORIZED_MACS_FILE = "authorized_macs.json"
 DB_FILE = "wids_database.db"
 BLOCK_LOG_FILE = "blocked_devices.log"
+DASHBOARD_FILE = "dashboard.html"
 
 # ========== DATA STORAGE ==========
-devices = {}
-packets = []
-authorized_macs = set()
-sensors = {}
-threat_log = []
+devices = {}          # MAC -> device info
+packets = []          # Recent packets (limit 1000)
+authorized_macs = set()  # Authorized MACs from file
+sensors = {}          # Sensor info
+threat_log = []       # Threat detection log (limit 100)
 packet_rates = defaultdict(list)
 
 # ========== LOAD CONFIG ==========
 def load_authorized_macs():
+    """Load authorized MACs from file"""
     global authorized_macs
     try:
         if os.path.exists(AUTHORIZED_MACS_FILE):
@@ -55,48 +59,60 @@ def load_authorized_macs():
             print(f"✅ Loaded {len(authorized_macs)} authorized MACs")
         else:
             authorized_macs = set()
+            # Create default file
+            save_authorized_macs()
+            print("📝 Created new authorized_macs.json file")
     except Exception as e:
         print(f"❌ Error loading authorized MACs: {e}")
         authorized_macs = set()
 
 def save_authorized_macs():
+    """Save authorized MACs to file"""
     try:
         with open(AUTHORIZED_MACS_FILE, 'w') as f:
             json.dump({
                 'authorized_macs': list(authorized_macs),
                 'updated': datetime.now().isoformat()
             }, f, indent=2)
+        print(f"💾 Saved {len(authorized_macs)} authorized MACs")
+        return True
     except Exception as e:
         print(f"❌ Error saving authorized MACs: {e}")
+        return False
 
 # ========== DATABASE FUNCTIONS ==========
 def init_database():
     """Initialize SQLite database"""
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    
-    # Blocked devices table
-    c.execute('''CREATE TABLE IF NOT EXISTS blocked_devices
-                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
-                  mac TEXT UNIQUE,
-                  reason TEXT,
-                  blocked_at TIMESTAMP,
-                  unblocked_at TIMESTAMP,
-                  status TEXT DEFAULT 'blocked')''')
-    
-    # Alerts table
-    c.execute('''CREATE TABLE IF NOT EXISTS alerts
-                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
-                  alert_type TEXT,
-                  mac TEXT,
-                  message TEXT,
-                  severity TEXT,
-                  created_at TIMESTAMP,
-                  email_sent BOOLEAN DEFAULT 0)''')
-    
-    conn.commit()
-    conn.close()
-    print("✅ Database initialized")
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        
+        # Blocked devices table
+        c.execute('''CREATE TABLE IF NOT EXISTS blocked_devices
+                     (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                      mac TEXT UNIQUE,
+                      reason TEXT,
+                      blocked_at TIMESTAMP,
+                      unblocked_at TIMESTAMP,
+                      status TEXT DEFAULT 'blocked')''')
+        
+        # Alerts table
+        c.execute('''CREATE TABLE IF NOT EXISTS alerts
+                     (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                      alert_type TEXT,
+                      mac TEXT,
+                      message TEXT,
+                      severity TEXT,
+                      created_at TIMESTAMP,
+                      email_sent BOOLEAN DEFAULT 0)''')
+        
+        conn.commit()
+        conn.close()
+        print("✅ Database initialized")
+        return True
+    except Exception as e:
+        print(f"❌ Database error: {e}")
+        return False
 
 def log_blocked_device(mac, reason):
     """Log blocked device to database"""
@@ -125,7 +141,7 @@ def get_blocked_devices():
     try:
         conn = sqlite3.connect(DB_FILE)
         c = conn.cursor()
-        c.execute("SELECT mac, reason, blocked_at FROM blocked_devices WHERE status='blocked'")
+        c.execute("SELECT mac, reason, blocked_at FROM blocked_devices WHERE status='blocked' ORDER BY blocked_at DESC")
         devices = c.fetchall()
         conn.close()
         
@@ -137,8 +153,23 @@ def get_blocked_devices():
                 'blocked_at': blocked_at
             })
         return blocked_list
-    except:
+    except Exception as e:
+        print(f"Error getting blocked devices: {e}")
         return []
+
+def unblock_mac_in_db(mac):
+    """Mark MAC as unblocked in database"""
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute("UPDATE blocked_devices SET status='unblocked', unblocked_at=? WHERE mac=?",
+                 (datetime.now(), mac.upper()))
+        conn.commit()
+        conn.close()
+        return True
+    except Exception as e:
+        print(f"Error unblocking in DB: {e}")
+        return False
 
 # ========== EMAIL FUNCTIONS ==========
 def send_email_alert(subject, body, is_html=False):
@@ -177,7 +208,7 @@ def send_email_alert(subject, body, is_html=False):
 
 def send_intrusion_alert(mac, attack_type, ssid, rssi):
     """Send intrusion alert email"""
-    subject = f"🚨 WIDS ALERT: {attack_type} detected"
+    subject = f"🚨 WIDS ALERT: {attack_type} detected on {ssid}"
     
     body_html = f"""
     <html>
@@ -218,7 +249,7 @@ def send_intrusion_alert(mac, attack_type, ssid, rssi):
             
             <div style="margin-top: 30px; padding-top: 20px; border-top: 1px solid #eee; color: #666; font-size: 12px;">
                 <p>This is an automated alert from your WIDS (Wireless Intrusion Detection System).</p>
-                <p>Check dashboard for more details: http://YOUR_SERVER_IP:8000</p>
+                <p>Check dashboard for more details: http://{get_ip()}:8000</p>
             </div>
         </div>
     </body>
@@ -243,21 +274,25 @@ def block_with_iptables(mac, reason):
             print(f"[{datetime.now()}] 🚨 BLOCKING {mac} - {reason}")
             
             # Block incoming traffic
-            subprocess.run(
+            result1 = subprocess.run(
                 f"sudo iptables -A INPUT -m mac --mac-source {mac} -j DROP",
-                shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-            )
-            # Block forwarded traffic
-            subprocess.run(
-                f"sudo iptables -A FORWARD -m mac --mac-source {mac} -j DROP",
-                shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+                shell=True, capture_output=True, text=True
             )
             
-            # Save iptables rules
-            subprocess.run(
-                "sudo iptables-save > /etc/iptables/rules.v4",
-                shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            # Block forwarded traffic
+            result2 = subprocess.run(
+                f"sudo iptables -A FORWARD -m mac --mac-source {mac} -j DROP",
+                shell=True, capture_output=True, text=True
             )
+            
+            # Try to save iptables rules
+            try:
+                subprocess.run(
+                    "sudo iptables-save | sudo tee /etc/iptables/rules.v4 > /dev/null",
+                    shell=True, timeout=5
+                )
+            except:
+                pass  # Saving might fail, but blocking still works
             
             # Log to database
             log_blocked_device(mac, reason)
@@ -281,20 +316,15 @@ def unblock_mac(mac):
         # Remove iptables rules
         subprocess.run(
             f"sudo iptables -D INPUT -m mac --mac-source {mac} -j DROP 2>/dev/null",
-            shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            shell=True
         )
         subprocess.run(
             f"sudo iptables -D FORWARD -m mac --mac-source {mac} -j DROP 2>/dev/null",
-            shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            shell=True
         )
         
         # Update database
-        conn = sqlite3.connect(DB_FILE)
-        c = conn.cursor()
-        c.execute("UPDATE blocked_devices SET status='unblocked', unblocked_at=? WHERE mac=?",
-                 (datetime.now(), mac))
-        conn.commit()
-        conn.close()
+        unblock_mac_in_db(mac)
         
         print(f"✅ Successfully unblocked {mac}")
         return True
@@ -309,6 +339,10 @@ def check_intrusion(packet):
     ssid = packet.get('ssid', '')
     attack_type = packet.get('attack_type', '')
     rssi = packet.get('rssi', -99)
+    
+    # Skip if no MAC
+    if not mac or mac == '00:00:00:00:00:00':
+        return None
     
     # Skip if authorized
     if mac in authorized_macs:
@@ -341,6 +375,10 @@ def check_intrusion(packet):
             'rssi': rssi
         })
         
+        # Keep only last 100 threats
+        if len(threat_log) > 100:
+            threat_log.pop(0)
+        
         return {
             'mac': mac,
             'attack_type': attack_type,
@@ -360,11 +398,18 @@ def auto_blocking_thread():
     while True:
         try:
             # Process recent packets for intrusions
+            processed_macs = set()
             for packet in packets[-100:]:  # Check last 100 packets
                 intrusion = check_intrusion(packet)
                 
                 if intrusion:
                     mac = intrusion['mac']
+                    
+                    # Skip if already processed in this cycle
+                    if mac in processed_macs:
+                        continue
+                    
+                    processed_macs.add(mac)
                     reason = intrusion['reason']
                     
                     # Auto-block for critical attacks
@@ -380,6 +425,9 @@ def auto_blocking_thread():
             
             time.sleep(5)  # Check every 5 seconds
             
+        except KeyboardInterrupt:
+            print("\n🛑 Stopping auto-blocking thread")
+            break
         except Exception as e:
             print(f"❌ Error in auto-blocking thread: {e}")
             time.sleep(10)
@@ -388,12 +436,20 @@ def auto_blocking_thread():
 @app.route('/')
 def dashboard():
     """Main dashboard"""
-    with open('dashboard.html', 'r') as f:
-        html = f.read()
-    return render_template_string(html, 
-                                 server_ip=get_ip(),
-                                 server_port=8000,
-                                 your_ssid=YOUR_SSID)
+    try:
+        # Check if dashboard.html exists
+        if not os.path.exists(DASHBOARD_FILE):
+            return "Error: dashboard.html not found. Please create it.", 404
+            
+        with open(DASHBOARD_FILE, 'r') as f:
+            html = f.read()
+            
+        return render_template_string(html, 
+                                     server_ip=get_ip(),
+                                     server_port=8000,
+                                     your_ssid=YOUR_SSID)
+    except Exception as e:
+        return f"Error loading dashboard: {e}", 500
 
 @app.route('/api/packet', methods=['POST'])
 def receive_packet():
@@ -414,7 +470,7 @@ def receive_packet():
         
         # Update device info
         mac = data.get('mac', '').upper()
-        if mac:
+        if mac and mac != '00:00:00:00:00:00':
             if mac not in devices:
                 devices[mac] = {
                     'mac': mac,
@@ -423,14 +479,16 @@ def receive_packet():
                     'packet_count': 1,
                     'rssi': data.get('rssi', -99),
                     'channel': data.get('channel', 0),
-                    'attack_types': set([data.get('attack_type', 'unknown')]),
+                    'attack_types': set(),
                     'authorized': mac in authorized_macs
                 }
             else:
                 devices[mac]['last_seen'] = datetime.now()
                 devices[mac]['packet_count'] += 1
-                if 'attack_type' in data:
-                    devices[mac]['attack_types'].add(data['attack_type'])
+                devices[mac]['rssi'] = data.get('rssi', devices[mac]['rssi'])
+            
+            if 'attack_type' in data and data['attack_type']:
+                devices[mac]['attack_types'].add(data['attack_type'])
         
         print(f"📦 Packet: {mac} | {data.get('attack_type', 'unknown')}")
         
@@ -441,103 +499,222 @@ def receive_packet():
         })
         
     except Exception as e:
-        print(f"❌ Error: {e}")
+        print(f"❌ Error processing packet: {e}")
         return jsonify({'error': str(e)}), 500
 
-@app.route('/api/devices')
+@app.route('/api/devices', methods=['GET'])
 def get_devices():
     """Get all detected devices"""
-    device_list = []
-    for mac, info in devices.items():
-        # Only include recent devices
-        if (datetime.now() - info['last_seen']).seconds < 3600:
-            device_list.append({
-                'mac': mac,
-                'first_seen': info['first_seen'].isoformat(),
-                'last_seen': info['last_seen'].isoformat(),
-                'packet_count': info['packet_count'],
-                'rssi': info['rssi'],
-                'channel': info['channel'],
-                'attack_types': list(info.get('attack_types', [])),
-                'authorized': info['authorized'],
-                'blocked': is_mac_blocked(mac)
+    try:
+        device_list = []
+        now = datetime.now()
+        
+        for mac, info in devices.items():
+            # Only include recent devices (last hour)
+            if (now - info['last_seen']).total_seconds() < 3600:
+                device_list.append({
+                    'mac': mac,
+                    'first_seen': info['first_seen'].isoformat(),
+                    'last_seen': info['last_seen'].isoformat(),
+                    'packet_count': info['packet_count'],
+                    'rssi': info['rssi'],
+                    'channel': info['channel'],
+                    'attack_types': list(info.get('attack_types', [])),
+                    'authorized': info['authorized'],
+                    'blocked': is_mac_blocked(mac)
+                })
+        
+        # Sort by last seen (newest first)
+        device_list.sort(key=lambda x: x['last_seen'], reverse=True)
+        
+        return jsonify(device_list)
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/packets', methods=['GET'])
+def get_packets():
+    """Get recent packets"""
+    try:
+        recent_packets = []
+        for p in packets[-50:]:
+            recent_packets.append({
+                'mac': p.get('mac', 'unknown'),
+                'rssi': p.get('rssi', -99),
+                'channel': p.get('channel', 0),
+                'attack_type': p.get('attack_type', 'unknown'),
+                'ssid': p.get('ssid', ''),
+                'timestamp': p.get('received_at', '')
             })
-    
-    return jsonify(device_list)
+        
+        return jsonify(recent_packets[::-1])  # Reverse to show newest first
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/authorized', methods=['GET'])
+def get_authorized():
+    """Get list of authorized MACs"""
+    try:
+        auth_list = []
+        for mac in sorted(authorized_macs):
+            auth_list.append({
+                'mac': mac,
+                'added_at': 'From config'
+            })
+        return jsonify(auth_list)
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/authorize/<mac>', methods=['POST'])
+def authorize_mac(mac):
+    """Add MAC to authorized list"""
+    try:
+        mac_upper = mac.upper()
+        
+        # Validate MAC format
+        if not re.match(r'^([0-9A-F]{2}:){5}[0-9A-F]{2}$', mac_upper):
+            return jsonify({'error': 'Invalid MAC format. Use AA:BB:CC:DD:EE:FF'}), 400
+        
+        authorized_macs.add(mac_upper)
+        
+        # Update device if it exists
+        if mac_upper in devices:
+            devices[mac_upper]['authorized'] = True
+        
+        # Save to file
+        save_authorized_macs()
+        
+        print(f"✅ Authorized MAC: {mac_upper}")
+        return jsonify({'status': 'authorized', 'mac': mac_upper})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/unauthorize/<mac>', methods=['POST'])
+def unauthorize_mac(mac):
+    """Remove MAC from authorized list"""
+    try:
+        mac_upper = mac.upper()
+        authorized_macs.discard(mac_upper)
+        
+        # Update device if it exists
+        if mac_upper in devices:
+            devices[mac_upper]['authorized'] = False
+        
+        # Save to file
+        save_authorized_macs()
+        
+        print(f"❌ Unauthorized MAC: {mac_upper}")
+        return jsonify({'status': 'unauthorized', 'mac': mac_upper})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
 @app.route('/api/block/<mac>', methods=['POST'])
 def block_device(mac):
     """Manually block a device"""
-    reason = request.json.get('reason', 'manual_block') if request.json else 'manual_block'
-    
-    if block_with_iptables(mac, reason):
-        return jsonify({'status': 'blocked', 'mac': mac})
-    else:
-        return jsonify({'error': 'Failed to block'}), 500
+    try:
+        reason = request.json.get('reason', 'manual_block') if request.json else 'manual_block'
+        
+        if block_with_iptables(mac, reason):
+            return jsonify({'status': 'blocked', 'mac': mac, 'message': f'Blocked {mac}'})
+        else:
+            return jsonify({'error': 'Failed to block'}), 500
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
 @app.route('/api/unblock/<mac>', methods=['POST'])
 def unblock_device(mac):
     """Unblock a device"""
-    if unblock_mac(mac):
-        return jsonify({'status': 'unblocked', 'mac': mac})
-    else:
-        return jsonify({'error': 'Failed to unblock'}), 500
+    try:
+        if unblock_mac(mac):
+            return jsonify({'status': 'unblocked', 'mac': mac, 'message': f'Unblocked {mac}'})
+        else:
+            return jsonify({'error': 'Failed to unblock'}), 500
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
-@app.route('/api/blocked')
+@app.route('/api/blocked', methods=['GET'])
 def list_blocked():
     """Get list of blocked devices"""
-    return jsonify(get_blocked_devices())
+    try:
+        return jsonify(get_blocked_devices())
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
-@app.route('/api/threats')
+@app.route('/api/threats', methods=['GET'])
 def get_threats():
     """Get recent threats"""
-    recent_threats = threat_log[-50:]
-    formatted = []
-    for threat in recent_threats:
-        formatted.append({
-            'time': threat['time'].isoformat(),
-            'mac': threat['mac'],
-            'type': threat['type'],
-            'reason': threat['reason'],
-            'rssi': threat['rssi']
-        })
-    return jsonify(formatted)
+    try:
+        recent_threats = []
+        for threat in threat_log[-50:]:
+            recent_threats.append({
+                'time': threat['time'].isoformat(),
+                'mac': threat['mac'],
+                'type': threat['type'],
+                'reason': threat['reason'],
+                'rssi': threat['rssi']
+            })
+        return jsonify(recent_threats)
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
-@app.route('/api/stats')
+@app.route('/api/stats', methods=['GET'])
 def get_stats():
     """Get system statistics"""
-    # Count devices
-    total = 0
-    authorized = 0
-    blocked = len(get_blocked_devices())
-    
-    for info in devices.values():
-        if (datetime.now() - info['last_seen']).seconds < 3600:
-            total += 1
-            if info['authorized']:
-                authorized += 1
-    
-    return jsonify({
-        'total_devices': total,
-        'authorized_devices': authorized,
-        'unauthorized_devices': total - authorized,
-        'blocked_devices': blocked,
-        'total_packets': len(packets),
-        'recent_threats': len(threat_log[-24:]),
-        'server_time': datetime.now().isoformat()
-    })
+    try:
+        # Count devices
+        total = 0
+        authorized = 0
+        now = datetime.now()
+        
+        for info in devices.values():
+            if (now - info['last_seen']).total_seconds() < 3600:
+                total += 1
+                if info['authorized']:
+                    authorized += 1
+        
+        blocked = len(get_blocked_devices())
+        
+        return jsonify({
+            'total_devices': total,
+            'authorized_devices': authorized,
+            'unauthorized_devices': total - authorized,
+            'blocked_devices': blocked,
+            'total_packets': len(packets),
+            'recent_threats': len(threat_log[-24:]),
+            'server_time': datetime.now().isoformat(),
+            'server_ip': get_ip(),
+            'protected_ssid': YOUR_SSID
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
 @app.route('/api/test_email', methods=['POST'])
 def test_email():
     """Test email configuration"""
-    test_subject = "✅ WIDS Test Email"
-    test_body = "This is a test email from your WIDS system. If you receive this, email configuration is working correctly!"
-    
-    if send_email_alert(test_subject, test_body):
-        return jsonify({'status': 'sent', 'message': 'Test email sent successfully'})
-    else:
-        return jsonify({'error': 'Failed to send test email'}), 500
+    try:
+        test_subject = "✅ WIDS Test Email"
+        test_body = "This is a test email from your WIDS system. If you receive this, email configuration is working correctly!"
+        
+        if send_email_alert(test_subject, test_body):
+            return jsonify({'status': 'sent', 'message': 'Test email sent successfully'})
+        else:
+            return jsonify({'error': 'Failed to send test email'}), 500
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
+@app.route('/api/status', methods=['GET'])
+def get_status():
+    """Get system status"""
+    return jsonify({
+        'status': 'running',
+        'time': datetime.now().isoformat(),
+        'email_enabled': EMAIL_CONFIG['enabled'],
+        'authorized_count': len(authorized_macs),
+        'device_count': len(devices),
+        'packet_count': len(packets),
+        'blocked_count': len(get_blocked_devices())
+    })
+
+# ========== UTILITY FUNCTIONS ==========
 def is_mac_blocked(mac):
     """Check if MAC is blocked"""
     blocked = get_blocked_devices()
@@ -547,8 +724,7 @@ def is_mac_blocked(mac):
     return False
 
 def get_ip():
-    """Get server IP"""
-    import socket
+    """Get server IP address"""
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.connect(('8.8.8.8', 80))
@@ -564,7 +740,13 @@ if __name__ == '__main__':
     print("🚀 WIDS SERVER WITH AUTO-BLOCKING & EMAIL")
     print("="*70)
     
-    # Initialize
+    # Check if running as root (required for iptables)
+    if os.geteuid() != 0:
+        print("❌ ERROR: Must run with sudo for iptables access!")
+        print("   Run: sudo python3 server.py")
+        sys.exit(1)
+    
+    # Load configuration
     load_authorized_macs()
     init_database()
     
@@ -572,14 +754,19 @@ if __name__ == '__main__':
     blocker_thread = threading.Thread(target=auto_blocking_thread, daemon=True)
     blocker_thread.start()
     
-    print(f"📡 Protecting SSID: {YOUR_SSID}")
+    print(f"\n📡 Protecting SSID: {YOUR_SSID}")
     print(f"📧 Email alerts: {'ENABLED' if EMAIL_CONFIG['enabled'] else 'DISABLED'}")
-    print(f"🏠 Dashboard: http://{get_ip()}:8000")
+    print(f"🏠 Dashboard URL: http://{get_ip()}:8000")
     print(f"🔧 IPTables auto-blocking: ACTIVE")
-    print("\n⚠️  IMPORTANT CONFIGURATION NEEDED:")
-    print("   1. Update EMAIL_CONFIG in server.py with your email credentials")
-    print("   2. Add your device MACs to authorized_macs.json")
-    print("   3. Run with sudo for iptables access: sudo python3 server.py")
+    print(f"📁 Database: {DB_FILE}")
+    print(f"📝 Log file: {BLOCK_LOG_FILE}")
+    
+    print("\n⚠️  IMPORTANT CONFIGURATION:")
+    print("   1. Edit EMAIL_CONFIG in server.py with your credentials")
+    print("   2. Add your device MACs via dashboard (Authorized MACs tab)")
+    print("   3. Make sure dashboard.html exists in current directory")
+    print("\n✅ Server starting... Press Ctrl+C to stop")
     print("="*70 + "\n")
     
+    # Run Flask
     app.run(host='0.0.0.0', port=8000, debug=False, threaded=True)
