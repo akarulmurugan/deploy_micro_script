@@ -1,116 +1,76 @@
 #!/bin/bash
-# WIDS Server Setup Script - FIXED VERSION
+# WIDS Complete Setup Script
 
 echo "========================================"
-echo "     WIDS SERVER SETUP - FIXED"
+echo "WIDS Auto-Blocking System Setup"
 echo "========================================"
 
 # Update system
-echo "[1/7] Updating system..."
+echo "📦 Updating system packages..."
 sudo apt update
-sudo apt upgrade -y
 
-# Install Python and pip
-echo "[2/7] Installing Python and dependencies..."
-sudo apt install -y python3 python3-pip python3-venv git curl
+# Install dependencies
+echo "📦 Installing Python and dependencies..."
+sudo apt install -y python3 python3-pip python3-venv sqlite3 iptables iptables-persistent
 
-# Install required Python packages
-echo "[3/7] Installing Python packages..."
-pip3 install flask pyserial requests
-
-# Install Arduino IDE for ESP32 programming
-echo "[4/7] Installing Arduino IDE..."
-sudo apt install -y arduino
+# Install Python packages
+echo "📦 Installing Python packages..."
+pip3 install flask pyopenssl cryptography requests
 
 # Create directory structure
-echo "[5/7] Creating directories..."
+echo "📁 Creating directory structure..."
 mkdir -p ~/wids-system
-mkdir -p ~/wids-system/logs
-mkdir -p ~/wids-system/data
-mkdir -p ~/wids-system/esp32-code
+cd ~/wids-system
 
-# Copy files
-echo "[6/7] Setting up files..."
-# Assuming server.py is in current directory
-cp server.py ~/wids-system/
-cp monitor_esp32.py ~/wids-system/
+# Create database
+echo "🗄️ Initializing database..."
+sqlite3 wids_database.db "CREATE TABLE IF NOT EXISTS blocked_devices (id INTEGER PRIMARY KEY, mac TEXT, reason TEXT, blocked_at TIMESTAMP, unblocked_at TIMESTAMP, status TEXT DEFAULT 'blocked');"
+sqlite3 wids_database.db "CREATE TABLE IF NOT EXISTS alerts (id INTEGER PRIMARY KEY, alert_type TEXT, mac TEXT, message TEXT, severity TEXT, created_at TIMESTAMP, email_sent BOOLEAN DEFAULT 0);"
 
-# Fix monitor_esp32.py for Ubuntu
-echo "[6.5/7] Fixing monitor_esp32.py for Ubuntu..."
-sed -i 's|/dev/ttyUSB{i}|/dev/ttyUSB*|g' ~/wids-system/monitor_esp32.py
-sed -i 's|f"/dev/ttyUSB{i}" for i in range(5)|glob.glob("/dev/ttyUSB*") + glob.glob("/dev/ttyACM*")|g' ~/wids-system/monitor_esp32.py
+# Create authorized MACs file
+echo "📝 Creating authorized MACs file..."
+echo '{"authorized_macs": [], "updated": "'$(date -Iseconds)'"}' > authorized_macs.json
+
+# Create empty log file
+touch blocked_devices.log
+
+# Set permissions
+chmod 755 ~/wids-system
+chmod 644 ~/wids-system/*
 
 # Create systemd service
-echo "[7/7] Creating system services..."
-
-# Server service
-sudo tee /etc/systemd/system/wids-server.service << EOF
+echo "⚙️ Creating systemd service..."
+sudo bash -c 'cat > /etc/systemd/system/wids.service << EOF
 [Unit]
-Description=WIDS Server
+Description=WIDS Auto-Blocking Service
 After=network.target
 
 [Service]
 Type=simple
-User=$USER
-WorkingDirectory=/home/$USER/wids-system
-ExecStart=/usr/bin/python3 /home/$USER/wids-system/server.py
+User=root
+WorkingDirectory=/root/wids-system
+ExecStart=/usr/bin/python3 /root/wids-system/server.py
 Restart=always
 RestartSec=10
-Environment=PYTHONUNBUFFERED=1
 
 [Install]
 WantedBy=multi-user.target
-EOF
+EOF'
 
-# Monitor service
-sudo tee /etc/systemd/system/wids-monitor.service << EOF
-[Unit]
-Description=WIDS ESP32 Monitor
-After=wids-server.service
-Requires=wids-server.service
-
-[Service]
-Type=simple
-User=$USER
-WorkingDirectory=/home/$USER/wids-system
-ExecStart=/usr/bin/python3 /home/$USER/wids-system/monitor_esp32.py
-Restart=always
-RestartSec=10
-Environment=PYTHONUNBUFFERED=1
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-# Enable and start services
-sudo systemctl daemon-reload
-sudo systemctl enable wids-server
-sudo systemctl enable wids-monitor
-sudo systemctl start wids-server
-sudo systemctl start wids-monitor
-
-# Fix permissions for serial port
-echo "Setting up serial port permissions..."
-sudo usermod -a -G dialout $USER
-sudo usermod -a -G tty $USER
-
+echo ""
 echo "========================================"
-echo "     SETUP COMPLETE!"
+echo "✅ WIDS System Setup Complete!"
 echo "========================================"
 echo ""
-echo "Server Dashboard: http://$(hostname -I | awk '{print $1}'):8000"
+echo "Next steps:"
+echo "1. Edit server.py and update EMAIL_CONFIG with your credentials"
+echo "2. Place server.py and dashboard.html in ~/wids-system/"
+echo "3. Add your device MACs via the dashboard"
+echo "4. Run: cd ~/wids-system && sudo python3 server.py"
+echo "5. Open browser: http://YOUR_SERVER_IP:8000"
 echo ""
-echo "Commands:"
-echo "  sudo systemctl status wids-server    # Check server status"
-echo "  sudo systemctl status wids-monitor   # Check monitor status"
-echo "  sudo journalctl -u wids-server -f    # View server logs"
-echo "  sudo journalctl -u wids-monitor -f   # View monitor logs"
-echo "  ls /dev/ttyUSB*                      # Check ESP32 port"
-echo ""
-echo "IMPORTANT NEXT STEPS:"
-echo "1. Reboot or logout/login to apply serial port permissions"
-echo "2. Upload ESP32 code (see esp32_wids_client.ino below)"
-echo "3. Connect ESP32 via USB"
-echo "4. Find ESP32 port: ls /dev/ttyUSB*"
-echo "5. Update monitor_esp32.py with correct port"
+echo "To run as service:"
+echo "  sudo systemctl enable wids"
+echo "  sudo systemctl start wids"
+echo "  sudo systemctl status wids"
 echo "========================================"
