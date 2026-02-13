@@ -18,8 +18,6 @@ echo "📦 Installing Python packages..."
 pip3 install flask pyopenssl cryptography requests
 
 # Create directory structure
-echo "📁 Creating directory structure..."
-mkdir -p ~/wids-system
 cd ~/wids-system
 
 # Create database
