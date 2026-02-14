@@ -258,37 +258,37 @@ def send_intrusion_alert(mac, attack_type, ssid, rssi):
     
     return send_email_alert(subject, body_html, is_html=True)
 
-# ========== IPTABLES BLOCKING FUNCTIONS ==========
+# ========== IPTABLES BLOCKING FUNCTIONS (FIXED - NO SUDO) ==========
 def block_with_iptables(mac, reason):
     """Block MAC address using iptables"""
     try:
         mac = mac.upper()
         
-        # Check if already blocked
+        # Check if already blocked - NO SUDO NEEDED
         check = subprocess.run(
-            f"sudo iptables -L INPUT -n 2>/dev/null | grep -i {mac}",
+            f"iptables -L INPUT -n 2>/dev/null | grep -i {mac}",
             shell=True, capture_output=True, text=True
         )
         
         if check.returncode != 0:  # Not blocked yet
             print(f"[{datetime.now()}] 🚨 BLOCKING {mac} - {reason}")
             
-            # Block incoming traffic
+            # Block incoming traffic - NO SUDO
             result1 = subprocess.run(
-                f"sudo iptables -A INPUT -m mac --mac-source {mac} -j DROP",
+                f"iptables -A INPUT -m mac --mac-source {mac} -j DROP",
                 shell=True, capture_output=True, text=True
             )
             
-            # Block forwarded traffic
+            # Block forwarded traffic - NO SUDO
             result2 = subprocess.run(
-                f"sudo iptables -A FORWARD -m mac --mac-source {mac} -j DROP",
+                f"iptables -A FORWARD -m mac --mac-source {mac} -j DROP",
                 shell=True, capture_output=True, text=True
             )
             
-            # Try to save iptables rules
+            # Try to save iptables rules - NO SUDO
             try:
                 subprocess.run(
-                    "sudo iptables-save | sudo tee /etc/iptables/rules.v4 > /dev/null",
+                    "iptables-save > /etc/iptables/rules.v4 2>/dev/null",
                     shell=True, timeout=5
                 )
             except:
@@ -313,13 +313,13 @@ def unblock_mac(mac):
         mac = mac.upper()
         print(f"[{datetime.now()}] 🔓 UNBLOCKING {mac}")
         
-        # Remove iptables rules
+        # Remove iptables rules - NO SUDO
         subprocess.run(
-            f"sudo iptables -D INPUT -m mac --mac-source {mac} -j DROP 2>/dev/null",
+            f"iptables -D INPUT -m mac --mac-source {mac} -j DROP 2>/dev/null",
             shell=True
         )
         subprocess.run(
-            f"sudo iptables -D FORWARD -m mac --mac-source {mac} -j DROP 2>/dev/null",
+            f"iptables -D FORWARD -m mac --mac-source {mac} -j DROP 2>/dev/null",
             shell=True
         )
         
